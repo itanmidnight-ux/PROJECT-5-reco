@@ -6,21 +6,17 @@ from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QMainWindow, QMessageBox, QTabWidget
 
 from reco_trading.ui.state_manager import StateManager
-from reco_trading.ui.tabs.alerts_tab import AlertsTab
 from reco_trading.ui.tabs.analytics_tab import AnalyticsTab
-from reco_trading.ui.tabs.cache_tab import CacheTab
 from reco_trading.ui.tabs.dashboard_tab import DashboardTab
-from reco_trading.ui.tabs.ml_intelligence_tab import MLIntelligenceTab
-from reco_trading.ui.tabs.health_tab import HealthTab
-from reco_trading.ui.tabs.hyperopt_tab import HyperoptTab
-from reco_trading.ui.tabs.intel_log_tab import IntelLogTab
 from reco_trading.ui.tabs.logs_tab import LogsTab
+from reco_trading.ui.tabs.intel_log_tab import IntelLogTab
 from reco_trading.ui.tabs.market_tab import MarketTab
 from reco_trading.ui.tabs.risk_tab import RiskTab
 from reco_trading.ui.tabs.settings_tab import SettingsTab
-from reco_trading.ui.tabs.strategy_tab import StrategyTab
 from reco_trading.ui.tabs.system_tab import SystemTab
+from reco_trading.ui.tabs.strategy_tab import StrategyTab
 from reco_trading.ui.tabs.trades_tab import TradesTab
+from reco_trading.ui.tabs.ai_monitor_tab import AIMonitorTab
 
 
 class MainWindow(QMainWindow):
@@ -42,30 +38,24 @@ class MainWindow(QMainWindow):
         self.market_tab = MarketTab()
         self.analytics_tab = AnalyticsTab()
         self.strategy_tab = StrategyTab()
-        self.freqai_tab = MLIntelligenceTab(state_manager=state_manager)
-        self.hyperopt_tab = HyperoptTab(state_manager=state_manager)
-        self.cache_tab = CacheTab(state_manager=state_manager)
-        self.health_tab = HealthTab(state_manager=state_manager)
         self.logs_tab = LogsTab(state_manager=state_manager)
-        self.intel_log_tab = IntelLogTab()
         self.risk_tab = RiskTab()
+        self.intel_log_tab = IntelLogTab()
         self.settings_tab = SettingsTab()
         self.system_tab = SystemTab()
+        self.ai_monitor_tab = AIMonitorTab()
 
         tabs.addTab(self.dashboard_tab, "Dashboard")
         tabs.addTab(self.trades_tab, "Trades")
         tabs.addTab(self.market_tab, "Market")
         tabs.addTab(self.analytics_tab, "Analytics")
         tabs.addTab(self.strategy_tab, "Strategy")
-        tabs.addTab(self.freqai_tab, "RecoAI")
-        tabs.addTab(self.hyperopt_tab, "Optimizer")
-        tabs.addTab(self.cache_tab, "Cache")
-        tabs.addTab(self.health_tab, "Health")
         tabs.addTab(self.logs_tab, "Logs")
-        tabs.addTab(self.intel_log_tab, "Intel Log")
         tabs.addTab(self.risk_tab, "Risk")
+        tabs.addTab(self.intel_log_tab, "Intel Log")
         tabs.addTab(self.settings_tab, "Settings")
         tabs.addTab(self.system_tab, "System")
+        tabs.addTab(self.ai_monitor_tab, "AI Monitor")
         self.setCentralWidget(tabs)
         self.tabs = tabs
         self.tab_fade = QPropertyAnimation(self, b"windowOpacity", self)
@@ -94,15 +84,12 @@ class MainWindow(QMainWindow):
             self.market_tab,
             self.analytics_tab,
             self.strategy_tab,
-            self.freqai_tab,
-            self.hyperopt_tab,
-            self.cache_tab,
-            self.health_tab,
             self.logs_tab,
-            self.intel_log_tab,
             self.risk_tab,
+            self.intel_log_tab,
             self.settings_tab,
             self.system_tab,
+            self.ai_monitor_tab,
         ):
             try:
                 tab.update_state(enriched_state)

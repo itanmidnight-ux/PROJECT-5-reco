@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(slots=True)
@@ -42,15 +42,15 @@ class CapitalProfileManager:
                 risk_per_trade_fraction=0.04,
                 max_trade_balance_fraction=0.10,
                 min_confidence=0.65,
-                max_trades_per_day=2,
-                cooldown_minutes=15,
-                loss_pause_minutes=90,
-                loss_pause_after_consecutive=1,
+                max_trades_per_day=25,          # Límite de seguridad, no el objetivo mínimo
+                cooldown_minutes=5,             # Cooldown corto para mayor frecuencia
+                loss_pause_minutes=45,          # Reducido para recuperar actividad antes
+                loss_pause_after_consecutive=2, # 2 pérdidas seguidas = pausa breve
                 max_spread_ratio=0.0010,
-                min_expected_reward_risk=3.0,
+                min_expected_reward_risk=2.5,   # RR más alcanzable con capital pequeño
                 min_operable_notional_buffer=1.25,
                 max_concurrent_trades=1,
-                entry_quality_floor=0.75,
+                entry_quality_floor=0.70,
                 size_multiplier=0.40,
             ),
             CapitalProfile(
@@ -62,15 +62,15 @@ class CapitalProfileManager:
                 risk_per_trade_fraction=0.03,
                 max_trade_balance_fraction=0.12,
                 min_confidence=0.62,
-                max_trades_per_day=2,
-                cooldown_minutes=12,
-                loss_pause_minutes=60,
+                max_trades_per_day=25,          # Límite de seguridad amplio
+                cooldown_minutes=5,             # Cooldown reducido
+                loss_pause_minutes=35,
                 loss_pause_after_consecutive=2,
                 max_spread_ratio=0.0015,
-                min_expected_reward_risk=2.8,
+                min_expected_reward_risk=2.3,
                 min_operable_notional_buffer=1.20,
                 max_concurrent_trades=1,
-                entry_quality_floor=0.72,
+                entry_quality_floor=0.68,
                 size_multiplier=0.50,
             ),
             CapitalProfile(
@@ -160,6 +160,10 @@ class CapitalProfileManager:
         for profile in self._profiles:
             upper_ok = profile.max_equity is None or safe_equity < profile.max_equity
             if safe_equity >= profile.min_equity and upper_ok:
+                if profile.name == "NANO":
+                    return replace(self._profiles[1], min_equity=0.0, min_confidence=max(self._profiles[1].min_confidence, 0.70))
+                if profile.name == "PREMIUM":
+                    return replace(self._profiles[4], max_equity=None, max_trades_per_day=max(self._profiles[4].max_trades_per_day, 10))
                 return profile
         return self._profiles[-1]
 

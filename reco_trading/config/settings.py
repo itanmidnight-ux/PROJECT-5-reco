@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import AliasChoices, Field, ConfigDict, field_validator
+from pydantic import AliasChoices, Field, ConfigDict, field_validator, computed_field
 from pydantic_settings import BaseSettings
+
 
 class Settings(BaseSettings):
     """Runtime configuration loaded from .env and environment variables."""
@@ -31,6 +32,24 @@ class Settings(BaseSettings):
     confirmation_timeframe: str = Field(default="15m", validation_alias=AliasChoices("CONFIRMATION_TIMEFRAME"))
     loop_sleep_seconds: int = 15
     history_limit: int = 300
+    low_ram_mode: bool = True
+    max_ram_mb: int = 500
+    ui_state_emit_on_each_log: bool = False
+    # LLM settings disabled - using filter-based validation only
+    # llm_fix_cycle_interval_seconds: int = 3600
+    # llm_cleanup_interval_seconds: int = 86400
+    # llm_mode: str = "base"
+    # llm_local_model: str = "qwen2.5:0.5b"
+    # ollama_base_url: str = "http://localhost:11434"
+    # llm_remote_endpoint: str = "https://api.openai.com/v1/chat/completions"
+    # llm_remote_model: str = "gpt-4o-mini"
+    # llm_remote_api_key: str = ""
+    # llm_local_keep_alive: str = "20m"
+    # llm_local_num_ctx: int = 256
+    # llm_local_num_predict: int = 4
+    # llm_local_top_p: float = 0.9
+    # llm_local_temperature: float = 0.0
+    # llm_local_healthcheck_enabled: bool = True
 
     # =========================
     # SIGNAL THRESHOLDS
@@ -59,33 +78,71 @@ class Settings(BaseSettings):
     # =========================
     # RISK MANAGEMENT
     # =========================
-    risk_per_trade_fraction: float = 0.01
+    risk_per_trade_fraction: float = 0.015
     min_trade_usdt: float = 5.0
-    max_concurrent_trades: int = 1
-    max_trades_per_day: int = 10
+    max_concurrent_trades: int = 2
+    max_trades_per_day: int = 15
     max_trade_balance_fraction: float = 0.20
     spot_only_mode: bool = True
-    daily_loss_limit_fraction: float = 0.03
-    max_drawdown_fraction: float = 0.10
+    daily_loss_limit_fraction: float = 0.05
+    max_drawdown_fraction: float = 0.15
     capital_reserve_ratio: float = 0.15
     min_cash_buffer_usdt: float = 10.0
     enable_capital_profiles: bool = True
     enforce_fee_floor: bool = True
     estimated_fee_rate: float = 0.001
-    min_expected_reward_risk: float = 1.8
-
+    min_expected_reward_risk: float = 1.5
+    stop_loss_pct: float = 2.0
+    take_profit_pct: float = 4.0
+    auto_stop_enabled: bool = True
+    auto_stop_break_even_trigger_pct: float = 0.008
+    auto_stop_break_even_buffer_pct: float = 0.0005
+    auto_stop_trailing_activate_pct: float = 0.012
+    auto_stop_trailing_delta_low_vol_pct: float = 0.006
+    auto_stop_trailing_delta_high_vol_pct: float = 0.010
+    auto_stop_max_duration_minutes: int = 180
+    
     # =========================
     # COOLDOWNS
     # =========================
-    cooldown_minutes: int = 4
+    cooldown_minutes: int = 2
     loss_pause_minutes: int = 20
     loss_pause_after_consecutive: int = 4
+    
+    # =========================
+    # AUTO-PAUSE CONTROL
+    # =========================
+    # DISABLE automatic pausing - bot will NEVER pause unless user explicitly requests it
+    # When True: risk warnings are logged but bot continues trading
+    # When False: original behavior with automatic pauses
+    disable_auto_pause: bool = True
+    auto_pause_on_drawdown: bool = False
+    auto_pause_on_consecutive_losses: bool = False
+    auto_pause_on_exchange_failure: bool = False
+    auto_pause_on_slippage: bool = False
+    auto_pause_on_high_swing: bool = False
 
     # =========================
-    # DATABASE
+    # EXECUTION ENGINE
     # =========================
-    postgres_dsn: str
+    execution_max_slippage_percent: float = 0.3  # Maximum allowed slippage (%)
+    execution_max_spread_percent: float = 0.2  # Maximum spread to enter (%)
+    execution_order_timeout_seconds: float = 5.0  # Timeout for order submission
+    execution_fill_timeout_seconds: float = 10.0  # Timeout for fill verification
+    execution_split_threshold_usdt: float = 500.0  # Split orders above this size
+    execution_max_split_parts: int = 5  # Maximum number of order splits
+    execution_retry_attempts: int = 3  # Number of retry attempts
+    execution_retry_delay_seconds: float = 1.0  # Delay between retries
+    execution_verify_fills: bool = True  # Verify order fills
+    execution_min_fill_percent: float = 95.0  # Minimum fill percentage
+
+    # =========================
+    # DATABASE (PostgreSQL, MySQL, or SQLite)
+    # =========================
+    postgres_dsn: Optional[str] = None
     postgres_admin_dsn: Optional[str] = None
+    mysql_dsn: Optional[str] = None
+    database_url: Optional[str] = None
 
     # =========================
     # REDIS
@@ -97,16 +154,66 @@ class Settings(BaseSettings):
     observability_port: int = 9108
     api_latency_window_size: int = 200
     stale_market_data_max_age_seconds: int = 180
-    feature_multi_symbol_enabled: bool = False
-    trading_symbols: list[str] = Field(default_factory=lambda: [
-        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", 
-        "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT",
-        "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT"
-    ], validation_alias=AliasChoices("TRADING_SYMBOLS", "SYMBOLS"))
+    feature_multi_symbol_enabled: bool = True
+    # Raw input for trading symbols - can be JSON array or comma-separated
+    trading_symbols_raw: str = Field(
+        default="BTC/USDT,ETH/USDT,SOL/USDT,DOGE/USDT,XRP/USDT",
+        validation_alias=AliasChoices("TRADING_SYMBOLS", "SYMBOLS")
+    )
+    
+    @computed_field
+    @property
+    def trading_symbols(self) -> list[str]:
+        """Parse trading_symbols from comma-separated string or JSON array."""
+        import json
+        v = self.trading_symbols_raw
+        if not v:
+            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
+        v = v.strip()
+        symbols = []
+        if v.startswith("["):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    symbols = [str(s).strip().replace("/", "").upper() for s in parsed if s]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        else:
+            symbols = [s.strip().replace("/", "").upper() for s in v.split(",") if s.strip()]
+        return symbols if symbols else ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT"]
+    
     max_global_exposure_fraction: float = 0.7
     max_symbol_correlation: float = 0.85
     symbol_capital_limits: dict[str, float] = Field(default_factory=dict, validation_alias=AliasChoices("SYMBOL_CAPITAL_LIMITS"))
-    feature_multi_symbol_enabled: bool = True
+
+    # =========================
+    # FUTURES TRADING
+    # =========================
+    futures_enabled: bool = False
+    futures_max_leverage: int = 50
+    default_leverage: int = 10
+    enable_position_hedging: bool = False
+
+    # =========================
+    # MOBILE APP
+    # =========================
+    mobile_api_enabled: bool = False
+    mobile_ws_enabled: bool = False
+    mobile_push_notifications: bool = False
+
+    # =========================
+    # SOCIAL TRADING
+    # =========================
+    social_trading_enabled: bool = False
+    strategy_marketplace: bool = False
+    copy_trading_enabled: bool = False
+
+    # =========================
+    # GRID TRADING
+    # =========================
+    grid_trading_enabled: bool = False
+    atr_grid_spacing: bool = True
+    dynamic_rebalancing: bool = True
 
     @property
     def symbol(self) -> str:
@@ -124,6 +231,17 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_symbol(cls, value: str) -> str:
         return str(value or "BTCUSDT").replace("/", "").upper()
+
+    @field_validator("binance_api_key", "binance_api_secret", mode="before")
+    @classmethod
+    def _sanitize_api_credentials(cls, value: object) -> str:
+        if value is None:
+            return ""
+        secret = str(value).strip()
+        lowered = secret.lower()
+        if lowered in {"", "none", "null", "changeme", "your_api_key_here", "your_api_secret_here"}:
+            return ""
+        return secret
 
     @field_validator("trading_symbols", mode="before")
     @classmethod
@@ -175,9 +293,11 @@ class Settings(BaseSettings):
                 continue
             normalized[str(symbol).replace("/", "").upper()] = cap_f
         return normalized
+
     model_config = ConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
+        case_sensitive=False,
     )

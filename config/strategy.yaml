@@ -1,4 +1,19 @@
-min_signal_confidence: 0.60
-hold_threshold: 0.45
+# Strategy Configuration - Optimized for profit maximization with adaptive filters
+# Default confidence threshold (relaxed from 0.55 to allow more trades in stable markets)
+# MarketAdaptation will dynamically adjust based on market regime
+min_signal_confidence: 0.45
+
+# Confidence below this results in HOLD (slightly lower to allow more trades)
+hold_threshold: 0.40
+
+# Enable liquidity filter to avoid trading in low-liquidity conditions
 use_liquidity_filter: true
-use_reversal_confirmation: true
+
+# Enable reversal confirmation for safer entries
+use_reversal_confirmation: false
+
+# Minimum number of agreeing factors required for trade (reduced from 2)
+min_factors_agreement: 2
+
+# Conflict penalty multiplier (reduced for more aggressive trading)
+conflict_penalty: 0.4

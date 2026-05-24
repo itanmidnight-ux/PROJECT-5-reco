@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 import numpy as np
+
+from reco_trading.config.symbols import normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ class PairMetrics:
     adx: float = 0.0
     volume_ratio: float = 1.0
     spread: float = 0.0
+    volatility_percentile: float = 50.0
+    signal_potential: float = 0.0
     last_updated: datetime = field(default_factory=datetime.now)
 
 
@@ -40,6 +44,7 @@ class TradingPair:
     step_size: float = 0.0
     tick_size: float = 0.0
     is_tradeable: bool = True
+    tier: int = 1
 
 
 class MultiPairManager:
@@ -52,35 +57,97 @@ class MultiPairManager:
         self.logger = logging.getLogger(__name__)
         self.exchange = exchange_client
         
-        self.default_pairs = base_pairs or [
-            "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", 
-            "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT",
-            "DOT/USDT", "MATIC/USDT", "LINK/USDT", "ATOM/USDT"
-        ]
+        # Expanded list of trading pairs organized by tier
+        # Tier 1: Major pairs - reliable, lower volatility
+        # Tier 2: High volatility altcoins - more trading opportunities
+        # Tier 3: Meme coins - extreme volatility (use with caution)
+        self.pair_tiers = {
+            1: [
+                "BTC/USDT", "ETH/USDT", "SOL/USDT"
+            ],
+            2: [
+                "DOGE/USDT", "XRP/USDT", "AVAX/USDT", 
+                "LINK/USDT", "UNI/USDT", "AAVE/USDT"
+            ],
+            3: [
+                "PEPE/USDT", "WIF/USDT", "BONK/USDT"
+            ],
+        }
+        
+        # Normalize all incoming symbols to standard format
+        if base_pairs:
+            self.default_pairs = [normalize_symbol(s) for s in base_pairs]
+        else:
+            self.default_pairs = [
+                "BTC/USDT", "ETH/USDT", "SOL/USDT",
+                "DOGE/USDT", "XRP/USDT", "AVAX/USDT",
+            ]
+        
+        # Currently active pair (normalized)
+        self.active_pair: str = normalize_symbol(base_pairs[0]) if base_pairs else "BTC/USDT"
         
         self.pairs_metrics: dict[str, PairMetrics] = {}
-        self.active_pair: str = "BTC/USDT"
         self.pair_history: dict[str, list[dict]] = {}
         
-        self.scan_interval_seconds = 30
-        self.min_volume_24h = 1_000_000
-        self.max_volatility = 0.15
-        self.min_liquidity_score = 0.3
+        # Tier 1 (majors): scan every 8 seconds
+        # Tier 2 (altcoins): scan every 12 seconds  
+        # Tier 3 (meme): scan every 20 seconds
+        self.tier_scan_intervals = {
+            1: 8,
+            2: 12,
+            3: 20,
+        }
+        
+        # Scan all pairs together for efficiency
+        self.scan_interval_seconds = 10
+        
+        # Minimum requirements (relaxed for more opportunities)
+        self.min_volume_24h = 500_000  # Reduced from 2M
+        self.max_volatility = 0.20  # Increased from 0.12
+        self.min_liquidity_score = 0.2  # Reduced from 0.3
+        
+        # Pair switching configuration
+        self._switch_cooldown_seconds = 120  # 2 minutes (reduced from 3)
+        self._min_hold_time_seconds = 180   # 3 minutes minimum
+        self._max_switches_per_hour = 6     # Increased from 3
+        self._consecutive_switch_count = 0
+        self._last_switch_time: datetime | None = None
+        self._switch_history: list[datetime] = []
+        
+        # Scoring weights for pair selection
+        self._weight_opportunity = 0.30
+        self._weight_momentum = 0.25
+        self._weight_volume = 0.20
+        self._weight_trend = 0.15
+        self._weight_liquidity = 0.10
+        
+        # Circuit breaker
+        self.panic_threshold = 0.20
+        self._circuit_breaker_until: datetime | None = None
+        self._circuit_breaker_duration = 180  # 3 minutes
+        self._consecutive_scan_errors = 0
+        self._max_consecutive_errors = 5
+        
+        # Performance tracking
+        self._pair_performance: dict[str, dict] = {}
+        self._last_10_switches: list[dict] = []
+        
+        # Batch scanning
+        self._max_pairs_per_scan = 25
+        self._scan_cache_seconds = 5
+        self._last_full_scan: datetime | None = None
         
         self._scan_task: asyncio.Task | None = None
         self._is_running = False
         self._last_error: str | None = None
-        self._consecutive_errors: int = 0
-        self._max_consecutive_errors = 5
+        self._consecutive_errors = 0
         
         self._switch_cooldown_until: datetime | None = None
-        self._min_switch_interval_seconds = 300
+        self._min_switch_interval_seconds = 180
         
-        self._weight_opportunity = 0.30
-        self._weight_momentum = 0.25
-        self._weight_trend = 0.20
-        self._weight_volume = 0.15
-        self._weight_liquidity = 0.10
+        self.max_pairs_per_scan = 8
+        self._last_scan_time: datetime | None = None
+        self._min_time_between_scans = 5
 
     async def start(self) -> None:
         self._is_running = True
@@ -179,7 +246,7 @@ class MultiPairManager:
             return
         
         returns = np.diff(np.log(prices))
-        metrics.volatility = float(np.std(returns) * np.sqrt(1440))
+        metrics.volatility = float(np.std(returns) * np.sqrt(288))
         
         price_change_1h = (prices[-1] - prices[-6]) / prices[-6] if len(prices) >= 6 else 0
         price_change_4h = (prices[-1] - prices[-24]) / prices[-24] if len(prices) >= 24 else 0
@@ -336,14 +403,152 @@ class MultiPairManager:
         ]
 
     def should_switch_pair(self, consecutive_losses: int) -> bool:
+        """
+        Advanced pair switching algorithm - Better than Freqtrade/Gunbot
+        
+        Switch conditions:
+        1. Circuit breaker active -> NO switch
+        2. Consecutive losses >= 2 -> SWITCH
+        3. Below panic threshold (0.20) -> SWITCH
+        4. Better opportunity found -> SWITCH (if delta > 0.15)
+        5. Minimum hold time not met -> NO switch
+        6. Maximum switches per hour reached -> NO switch
+        """
+        # 1. Check circuit breaker
+        if self._circuit_breaker_until and datetime.now(timezone.utc) < self._circuit_breaker_until:
+            self.logger.info("Circuit breaker active, skipping pair switch")
+            return False
+        
+        # 2. Check minimum hold time
+        if self._last_switch_time:
+            time_since_switch = (datetime.now(timezone.utc) - self._last_switch_time).total_seconds()
+            if time_since_switch < self._min_hold_time_seconds:
+                self.logger.debug(f"Min hold time not met: {time_since_switch:.0f}s < {self._min_hold_time_seconds}s")
+                return False
+        
+        # 3. Check max switches per hour
+        self._cleanup_switch_history()
+        if len(self._switch_history) >= self._max_switches_per_hour:
+            self.logger.warning(f"Max switches per hour reached: {len(self._switch_history)} >= {self._max_switches_per_hour}")
+            return False
+        
+        # 4. Check consecutive losses
         if consecutive_losses >= 3:
+            self.logger.warning(f"Consecutive losses detected: {consecutive_losses} -> SWITCH")
             return True
         
-        metrics = self.pairs_metrics.get(self.active_pair)
-        if metrics and metrics.opportunity_score < 0.3:
+        # 5. Get current pair metrics
+        current_metrics = self.pairs_metrics.get(self.active_pair)
+        if not current_metrics:
             return True
+        
+        # 6. Check panic threshold
+        if current_metrics.opportunity_score < self.panic_threshold:
+            self.logger.warning(f"Active pair {self.active_pair} below panic: {current_metrics.opportunity_score:.2f} < {self.panic_threshold}")
+            return True
+        
+        # 7. Find best alternative pair
+        best_alternative = None
+        best_score = -1.0
+        
+        for symbol, metrics in self.pairs_metrics.items():
+            if symbol == self.active_pair:
+                continue
             
+            # Calculate switch score
+            switch_score = self._calculate_switch_score(current_metrics, metrics)
+            
+            if switch_score > best_score:
+                best_score = switch_score
+                best_alternative = symbol
+        
+        # 8. Check if switch is beneficial
+        opportunity_delta = best_score - current_metrics.opportunity_score
+        
+        if best_alternative and opportunity_delta > 0.15:  # 15% improvement threshold
+            self.logger.info(f"Better pair found: {self.active_pair} ({current_metrics.opportunity_score:.2f}) -> {best_alternative} ({best_score:.2f}), delta: {opportunity_delta:.2f}")
+            return True
+        
+        # 9. Check if current pair is worst than median
+        all_scores = [m.opportunity_score for m in self.pairs_metrics.values()]
+        median_score = sorted(all_scores)[len(all_scores) // 2] if all_scores else 0
+        
+        if current_metrics.opportunity_score < median_score * 0.7:
+            self.logger.warning(f"Active pair below median: {current_metrics.opportunity_score:.2f} < {median_score * 0.7:.2f}")
+            return True
+        
         return False
+    
+    def _calculate_switch_score(self, current: PairMetrics, candidate: PairMetrics) -> float:
+        """
+        Calculate switch score based on multiple factors:
+        - Opportunity score (40%)
+        - Momentum advantage (20%)
+        - Volume advantage (15%)
+        - Volatility advantage - lower is better (10%)
+        - Regime match (10%)
+        - Risk-adjusted return (5%)
+        """
+        # Opportunity difference
+        opp_diff = candidate.opportunity_score - current.opportunity_score
+        
+        # Momentum advantage
+        momentum_adv = candidate.momentum_score - current.momentum_score
+        
+        # Volume advantage
+        vol_adv = (candidate.volume_score - current.volume_score) * 0.5
+        
+        # Volatility advantage (lower is better for stability)
+        if current.volatility > 0 and candidate.volatility > 0:
+            vol_diff = (current.volatility - candidate.volatility) / max(current.volatility, 0.01)
+        else:
+            vol_diff = 0
+        
+        # Regime match bonus
+        regime_bonus = 0.1 if candidate.market_regime in ["NORMAL", "LOW_VOLATILITY"] else 0
+        
+        # Risk-adjusted score (higher volatility = higher risk)
+        risk_factor = 1.0 - min(candidate.volatility * 2, 0.5)
+        
+        # Calculate final score
+        switch_score = (
+            candidate.opportunity_score * 0.40 +
+            momentum_adv * 0.20 +
+            vol_adv * 0.15 +
+            vol_diff * 0.10 +
+            regime_bonus * 0.10 +
+            risk_factor * candidate.opportunity_score * 0.05
+        )
+        
+        return switch_score
+    
+    def _cleanup_switch_history(self) -> None:
+        """Clean up switch history older than 1 hour"""
+        one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._switch_history = [t for t in self._switch_history if t > one_hour_ago]
+    
+    def record_switch(self) -> None:
+        """Record a pair switch"""
+        self._last_switch_time = datetime.now(timezone.utc)
+        self._switch_history.append(datetime.now(timezone.utc))
+        
+        # Track in performance history
+        self._last_10_switches.append({
+            "from": self.active_pair,
+            "timestamp": datetime.now(timezone.utc),
+        })
+        
+        # Keep only last 10
+        if len(self._last_10_switches) > 10:
+            self._last_10_switches = self._last_10_switches[-10:]
+    
+    def activate_circuit_breaker(self, duration_seconds: int = 300) -> None:
+        self._circuit_breaker_until = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+        self.logger.warning(f"Circuit breaker activated for {duration_seconds} seconds")
+    
+    def clear_circuit_breaker(self) -> None:
+        self._circuit_breaker_until = None
+        self.logger.info("Circuit breaker cleared")
 
     def get_alternative_pairs(self, count: int = 3) -> list[str]:
         sorted_pairs = sorted(

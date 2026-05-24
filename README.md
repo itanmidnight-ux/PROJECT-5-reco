@@ -1,774 +1,223 @@
-# Reco Trading Bot (Binance Spot)
+# Reco Trading
 
-Production-oriented algorithmic trading bot for small-capital spot trading on Binance, built around a state-machine engine, multi-factor voting signals, strict risk controls, and persistent telemetry.
+Bot de trading algorítmico para cripto con arquitectura asíncrona, motor de riesgo, dashboard web en tiempo real (SSE) y dashboard terminal (Rich TUI).
 
-## ⚡️ Características Principales (Versión Avanzada)
-
-### ✨ Nuevas Características Implementadas
-
-#### 🔌 API Server & Web UI
-- **FastAPI Server** con endpoints REST
-- **WebSocket** para tiempo real
-- **CORS** configurado
-- **Documentación automática** en `/docs`
-
-#### 🐳 Docker & Multiplataforma
-- **Dockerfile** optimizado para producción
-- **docker-compose.yml** con PostgreSQL + Redis
-- **Ejecución 24/7** en cualquier servidor
-
-#### 🧠 Estrategias Avanzadas
-- **30+ indicadores técnicos** (RSI, MACD, EMA, Bollinger Bands, Ichimoku, etc.)
-- **Patrones de velas** (Pin Bar, Hammer, Engulfing, Doji)
-- **Soporte multi-timeframe**
-- **Volume Profile**
-
-#### 🛡️ Sistema de Protecciones (como FreqTrade)
-- **Cooldown Period**: Espera después de perder trade
-- **Low Profit Pairs**: Bloquea pares con baja ganancia
-- **Max Drawdown**: Proteção global contra drawdown
-- **Stoploss Guard**: Detiene después de múltiples stoploss
-
-#### 📊 Filtros de Pares (PairList)
-- **VolumePairList**: Filtrar por volumen
-- **PriceFilter**: Rango de precios
-- **SpreadFilter**: Spread máximo
-- **VolatilityFilter**: Volatilidad
-- **AgeFilter**: Tiempo mínimos cotizando
-
-#### 💰 Gestión de Riesgo Avanzada
-- **Capital Profiles** (NANO, MICRO, SMALL, MEDIUM, LARGE, PREMIUM)
-- **Partial Take Profit**: 3 niveles de salida
-- **Safety Orders (DCA)**: Promediación a la baja
-- **Trailing Stop** dinámico
+## Contenido
+- [Características](#características)
+- [Arquitectura](#arquitectura)
+- [Requisitos](#requisitos)
+- [Instalación rápida](#instalación-rápida)
+- [Configuración `.env`](#configuración-env)
+- [Ejecución](#ejecución)
+- [Dashboard web (seguridad)](#dashboard-web-seguridad)
+- [Docker](#docker)
+- [Operación y tuning de filtros](#operación-y-tuning-de-filtros)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Aviso importante](#aviso-importante)
 
 ---
 
-## 🚀 Instalación
+## Características
 
-### 📋 Requisitos Previos
-
-- Python 3.10+ 
-- PostgreSQL 14+ (opcional, SQLite por defecto)
-- Redis (opcional)
-- Docker y Docker Compose (para instalación en contenedor)
-
-### 🐳 Opción 1: Docker (Recomendado)
-
-#### Instalación con Docker Compose
-
-```bash
-# 1. Clonar el repositorio
-git clone https://github.com/tu-usuario/reco-trading.git
-cd reco-trading
-
-# 2. Configurar variables de entorno
-cp .env.example .env
-# Edita .env con tus credenciales
-
-# 3. Iniciar servicios
-docker-compose up -d
-
-# 4. Ver logs
-docker-compose logs -f app
-
-# 5. Detener servicios
-docker-compose down
-```
-
-#### docker-compose.yml incluye:
-- **app**: Reco-Trading bot
-- **postgres**: Base de datos PostgreSQL
-- **redis**: Cache y colas
-- **nginx**: Proxy reverso (opcional)
-
-#### Comandos Docker útiles
-
-```bash
-# Iniciar en background
-docker-compose up -d
-
-# Ver logs en tiempo real
-docker-compose logs -f
-
-# Ver estado de servicios
-docker-compose ps
-
-# Reiniciar servicio específico
-docker-compose restart app
-
-# Detener y eliminar datos
-docker-compose down -v
-
-# Reconstruir imagen
-docker-compose build --no-cache
-```
-
-#### Puertos expuestos
-
-| Servicio | Puerto | Descripción |
-|----------|--------|-------------|
-| App | 8080 | API REST |
-| PostgreSQL | 5432 | Base de datos |
-| Redis | 6379 | Cache |
+- **Motor de trading asíncrono** con control de riesgo, sizing adaptativo y filtros por régimen.
+- **Validación de señales multi-factor** (tendencia, momentum, volumen, estructura, volatilidad).
+- **Adaptación automática de filtros** según actividad, calidad de señal y estado de sesión.
+- **Soporte micro-balance** para cuentas pequeñas con ajuste dinámico de umbrales.
+- **Dashboard web Flask** con endpoint SSE (`/api/stream`) y controles operativos.
+- **Dashboard terminal Rich (TUI)** para operación headless en VPS/servidor.
+- **Persistencia** SQLite/PostgreSQL/MySQL vía SQLAlchemy async.
+- **Modo de decisión LLM configurable**: `base` o `llm_remote`.
 
 ---
 
-### 💻 Opción 2: Instalación Local
+## Arquitectura
 
-#### Linux (Ubuntu/Debian)
-
-```bash
-# 1. Clonar repositorio
-git clone https://github.com/tu-usuario/reco-trading.git
-cd reco-trading
-
-# 2. Ejecutar instalador
-chmod +x install.sh
-./install.sh
-
-# 3. Configurar credenciales
-nano .env
-
-# 4. Ejecutar
-chmod +x run.sh
-./run.sh
-```
-
-#### macOS
-
-```bash
-# 1. Instalar Homebrew (si no tienes)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# 2. Instalar dependencias
-brew install python@3.11 postgresql@14 redis
-
-# 3. Clonar y configurar
-git clone https://github.com/tu-usuario/reco-trading.git
-cd reco-trading
-
-# 4. Crear entorno virtual
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 5. Configurar PostgreSQL
-brew services start postgresql@14
-createdb reco_trading
-
-# 6. Configurar y ejecutar
-cp .env.example .env
-nano .env
-./run.sh
-```
-
-#### Windows (WSL2 recomendado)
-
-```bash
-# 1. Instalar WSL2
-wsl --install -d Ubuntu
-
-# 2. Seguir instrucciones de Linux dentro de WSL
+```text
+reco_trading/
+├── core/               # Motor principal, estado, runtime settings, ejecución
+├── strategy/           # Señales, filtros de régimen, confluencia
+├── risk/               # Perfiles de capital, optimizer de inversión, sizing
+├── database/           # Repository async y modelos
+├── ui/                 # Dashboard terminal (Rich) + UI state
+├── web_site/           # Dashboard web Flask + template SSE
+└── api/                # API complementaria
 ```
 
 ---
 
-### ⚙️ Configuración
+## Requisitos
 
-#### Archivo .env
+- Python **3.11+**
+- Linux / Windows
+- API Key y Secret de Binance (testnet recomendado para primeras pruebas)
+
+Opcional:
+- PostgreSQL/MySQL para persistencia avanzada
+- Docker + Docker Compose
+
+---
+
+## Instalación rápida
+
+### Linux
+
+```bash
+chmod +x install-linux.sh
+./install-linux.sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install-windows-powershell.ps1
+```
+
+> Los instaladores generan/actualizan `.env` y dejan el proyecto listo para ejecutar.
+> También limpian variables obsoletas de integraciones antiguas (por ejemplo claves heredadas de Ollama).
+
+---
+
+## Configuración `.env`
+
+Ejemplo base recomendado:
 
 ```env
-# ==============================
-# RECO TRADING - CONFIGURACIÓN
-# ==============================
+# Exchange
+BINANCE_API_KEY=TU_API_KEY
+BINANCE_API_SECRET=TU_API_SECRET
+BINANCE_TESTNET=true
+CONFIRM_MAINNET=false
 
-# Credenciales Binance
-BINANCE_API_KEY=tu_api_key_aqui
-BINANCE_API_SECRET=tu_api_secret_aqui
+# Runtime
+TRADING_SYMBOL=BTC/USDT
+PRIMARY_TIMEFRAME=5m
+CONFIRMATION_TIMEFRAME=15m
 
-# Modo de operación
-BINANCE_TESTNET=true          # true = testnet, false = mainnet
-ENVIRONMENT=testnet           # testnet o production
-RUNTIME_PROFILE=paper         # paper, nano, micro, small, medium, large
+# Database (elige una)
+DATABASE_URL=sqlite+aiosqlite:///./data/reco_trading.db
+# POSTGRES_DSN=postgresql+asyncpg://user:pass@localhost:5432/reco_trading
+# MYSQL_DSN=mysql+aiomysql://user:pass@localhost:3306/reco_trading
 
-# Base de datos
-# SQLite (por defecto, recomendado para principiantes)
-DATABASE_URL=sqlite:///reco_trading.db
+# LLM decision mode
+LLM_MODE=base
+LLM_REMOTE_ENDPOINT=https://api.openai.com/v1/chat/completions
+LLM_REMOTE_MODEL=gpt-4o-mini
+LLM_REMOTE_API_KEY=
 
-# PostgreSQL (opcional, para producción)
-# POSTGRES_HOST=localhost
-# POSTGRES_PORT=5432
-# POSTGRES_USER=trading
-# POSTGRES_PASSWORD=tu_password
-# POSTGRES_DB=reco_trading_prod
-
-# Redis (opcional)
-REDIS_URL=redis://localhost:6379/0
-
-# API Server
-API_ENABLED=true
-API_HOST=0.0.0.0
-API_PORT=8080
-
-# Telegram (opcional)
-# TELEGRAM_ENABLED=false
-# TELEGRAM_TOKEN=tu_token
-# TELEGRAM_CHAT_ID=tu_chat_id
+# Dashboard security
+DASHBOARD_AUTH_ENABLED=true
+DASHBOARD_AUTH_MODE=token
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=admin
+DASHBOARD_API_TOKEN=CAMBIA_ESTE_TOKEN
 ```
-
-#### Obtener credenciales de Binance
-
-1. Ve a [Binance Testnet](https://testnet.binance.vision/)
-2. Inicia sesión
-3. Ve a API Management
-4. Crea una nueva API Key
-5. Copia la API Key y Secret al archivo .env
 
 ---
 
-### 🎯 Primeros Pasos
+## Ejecución
 
-#### 1. Verificar instalación
+### Entorno local
 
 ```bash
-# Verificar que el bot responde
-python -m reco_trading --version
-
-# Ver help
-python -m reco_trading --help
+source .venv/bin/activate
+python -m reco_trading.main
 ```
 
-#### 2. Modo Dry-Run (Recomendado)
+### Script helper
 
 ```bash
-# Iniciar en modo simulación
-./run.sh --dry-run
-
-# o con Docker
-docker-compose run --rm app trade start --dry-run
+./run.sh
 ```
 
-#### 3. Comandos básicos
+---
+
+## Dashboard web (seguridad)
+
+- URL local por defecto: `http://127.0.0.1:9000`
+- Endpoints principales:
+  - `/api/health`
+  - `/api/snapshot`
+  - `/api/stream` (SSE tiempo real)
+  - `/api/settings` (runtime settings)
+  - `/api/control/<action>`
+
+Autenticación:
+- `DASHBOARD_AUTH_MODE=token` (recomendado)
+- `DASHBOARD_AUTH_MODE=basic`
+- `DASHBOARD_AUTH_MODE=hybrid`
+
+---
+
+## Docker
+
+Levantar stack:
 
 ```bash
-# Ver estado del bot
-python -m reco_trading trade status
-
-# Ver estrategias disponibles
-python -m reco_trading list-strategies
-
-# Listar exchanges
-python -m reco_trading list-exchanges
-
-# Iniciar backtesting
-python -m reco_trading backtesting start --strategy DefaultStrategy --timeframe 5m
+docker compose up -d --build
 ```
+
+Servicios incluidos:
+- `app` (bot + dashboard web)
+- `api` (API complementaria)
+- `postgres`
+- `redis`
+
+Puertos expuestos en loopback (`127.0.0.1`) para reducir superficie de ataque.
 
 ---
 
-### 🔧 Configuración Avanzada
+## Operación y tuning de filtros
 
-#### Perfiles de Capital
+El bot usa configuración base por símbolo y ajuste adaptativo en runtime:
 
-| Perfil | Capital | Riesgo por Trade |
-|--------|---------|------------------|
-| NANO | $3-25 | 4% |
-| MICRO | $25-100 | 3% |
-| SMALL | $100-500 | 2% |
-| MEDIUM | $500-2000 | 1.5% |
-| LARGE | $2000-10000 | 1% |
-| PREMIUM | $10000+ | 0.5% |
+- Recalibración de filtros por datos recientes de mercado.
+- Relax/tighten por actividad (`trades_today`), calidad (`signal_quality_score`) y riesgo.
+- Refuerzo anti-falsas señales con controles sobre ADX/confianza/volumen.
+- Modo micro-balance para mantener operatividad en cuentas pequeñas.
 
-#### Configurar PostgreSQL
+Recomendación operativa:
+1. Empezar en **testnet**.
+2. Observar 24–72h de telemetría (`autonomous_filters`, `autonomous_filter_reason`, `micro_balance_mode`).
+3. Ajustar umbrales gradualmente (no cambios agresivos de una sola vez).
+
+---
+
+## Testing
+
+Ejecutar suite principal:
 
 ```bash
-# Crear base de datos manualmente
-psql -U postgres -c "CREATE DATABASE reco_trading_prod;"
-psql -U postgres -c "CREATE USER trading WITH PASSWORD 'tu_password';"
-psql -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE reco_trading_prod TO trading;"
+pytest tests/ -x -q
 ```
 
----
-
-### 🆘 Solución de Problemas
-
-#### Error de conexión a PostgreSQL
+Chequeos de sintaxis útiles:
 
 ```bash
-# Verificar que PostgreSQL está corriendo
-sudo systemctl status postgresql
-
-# Iniciar PostgreSQL
-sudo systemctl start postgresql
-```
-
-#### Error de conexión a Redis
-
-```bash
-# Verificar Redis
-redis-cli ping
-
-# Iniciar Redis
-redis-server
-```
-
-#### Error de credenciales de Binance
-
-```Asegúrate de que:
-1. La API Key tiene permisos de trading
-2. La IP está whitelisted (o désactiva-restricción de IP)
-3. Estás usando testnet para pruebas
-
-#### Ver logs detallados
-
-```bash
-# Docker
-docker-compose logs -f app
-
-# Local
-python -m reco_trading trade start -v
+python -m py_compile reco_trading/main.py web_site/dashboard_server.py reco_trading/core/bot_engine.py
+bash -n run.sh install-linux.sh
 ```
 
 ---
 
-## 📊 API Endpoints
+## Troubleshooting
 
-| Método | Endpoint | Descripción |
-|--------|---------|-------------|
-| GET | `/` | Estado del API |
-| GET | `/health` | Health check |
-| GET | `/api/v1/status` | Estado del bot |
-| GET | `/api/v1/balance` | Balance de cuenta |
-| GET | `/api/v1/trades` | Historial de trades |
-| GET | `/api/v1/open-trades` | Trades abiertos |
-| GET | `/api/v1/stats` | Estadísticas |
-| GET | `/api/v1/config` | Configuración |
-| WS | `/ws` | WebSocket en tiempo real |
+### 1) `Unauthorized` en web dashboard
+- Verifica `DASHBOARD_AUTH_ENABLED`, `DASHBOARD_AUTH_MODE`, token/credenciales.
 
----
+### 2) Pocos trades
+- Revisa `min_confidence`, `adx_threshold`, `volume_buy_threshold`.
+- Verifica `autonomous_filter_reason` y `micro_balance_mode` en snapshot.
 
-## ⚙️ Perfiles de Capital
+### 3) Sin datos de mercado / señales neutras constantes
+- Revisa conectividad con exchange y frescura de datos (`stale_market_data_ratio`).
 
-| Perfil | Capital | Riesgo/Trade | Trades/Día |
-|--------|---------|--------------|------------|
-| NANO | $3-25 | 4% | 2 |
-| MICRO | $25-50 | 3% | 2 |
-| SMALL | $50-100 | 2.5% | 3 |
-| MEDIUM | $100-500 | 2% | 4 |
-| LARGE | $500-1000 | 1.5% | 5 |
-| PREMIUM | $1000+ | 1.2% | 6 |
+### 4) Error DB
+- Confirma DSN y disponibilidad del motor (SQLite/Postgres/MySQL).
 
 ---
 
-## 🎯 Filtros por Símbolo (Adaptativos)
+## Aviso importante
 
-| Símbolo | ADX ≥ | RSI Buy | RSI Sell | Volumen |
-|---------|--------|---------|----------|---------|
-| BTC/USDT | 12 | 48 | 52 | 0.90 |
-| ETH/USDT | 12 | 48 | 52 | 0.90 |
-| SOL/USDT | 12 | 48 | 52 | 0.85 |
-| BNB/USDT | 12 | 48 | 52 | 0.85 |
-| XRP/USDT | 10 | 45 | 55 | 0.80 |
-
----
-
-## 🛡️ Protecciones Activas
-
-1. **Cooldown Period**: 15 minutos entre trades
-2. **Daily Loss Limit**: 3% del balance
-3. **Max Trades/Day**: Según perfil de capital
-4. **Stoploss Guard**: Bloquea después de 3 stoploss consecutivos
-
----
-
-## 📈 Indicadores Técnicos Disponibles
-
-### Tendencia
-- EMA9, EMA20, EMA50, EMA100, EMA200
-- Ichimoku Cloud
-- KST (Know Sure Thing)
-
-### Momentum
-- RSI (14, 28)
-- Stochastic
-- Williams %R
-- Ultimate Oscillator
-- ROC (Rate of Change)
-
-### Volatilidad
-- ATR, ATR%
-- Bollinger Bands (width, position)
-- Donchian Channels
-
-### Volumen
-- VWAP
-- OBV
-- ADI
-- Chaikin Money Flow
-- Volume MA
-
----
-
-## 🏗️ Arquitectura
-
-```
-reco_trading/
-├── api/
-│   └── server.py           # FastAPI Server
-├── core/
-│   ├── bot_engine.py       # Motor principal
-│   └── state_machine.py    # Estados del bot
-├── exchange/
-│   ├── binance_client.py   # Cliente Binance
-│   └── order_manager.py   # Órdenes
-├── strategy/
-│   ├── indicators.py      # 30+ indicadores
-│   ├── signal_engine.py    # Generación de señales
-│   └── confidence_model.py # Modelo de confianza
-├── risk/
-│   ├── capital_profile.py # Perfiles de capital
-│   ├── position_manager.py # Gestión de posiciones
-│   └── adaptive_sizer.py  # Tamaño de posición
-├── plugins/
-│   ├── pairlist.py        # Filtros de pares
-│   └── protections.py     # Protecciones
-├── data/
-│   └── market_stream.py   # Streaming de datos
-├── database/
-│   ├── models.py          # Modelos SQLAlchemy
-│   └── repository.py      # Persistencia
-├── ui/
-│   └── tabs/             # Interfaz PyQt
-└── config/
-    └── settings.py        # Configuración
-```
-
----
-
-## 📋 Modos de Ejecución
-
-1. **Testnet**: Simulación con dinero fake
-2. **Dry-Run**: Simulación en tiempo real
-3. **Live**: Trading real (configurar `BINANCE_TESTNET=false`)
-
----
-
-## 🔧 Configuración Avanzada
-
-### Docker Compose
-```yaml
-services:
-  app:
-    build: .
-    ports:
-      - "8080:8080"
-    env_file: .env
-  postgres:
-    image: timescale/timescaledb:latest-pg15
-  redis:
-    image: redis:7-alpine
-```
-
----
-
-## 📝 Changelog
-
-### v2.0.0 (Actual)
-- ✅ API Server con FastAPI
-- ✅ WebSocket support
-- ✅ Docker multiplatform
-- ✅ 30+ indicadores técnicos
-- ✅ PairList filters (Volume, Price, Spread, Volatility)
-- ✅ Protecciones (Cooldown, Max Drawdown, Stoploss Guard)
-- ✅ Perfiles de capital optimizados
-- ✅ Partial Take Profit
-- ✅ Safety Orders (DCA)
-- ✅ Filtros adaptativos por símbolo
-- ✅ CLI Commands (FreqTrade-style)
-- ✅ Config Schema con Pydantic
-- ✅ Sistema de validación de configuración
-- ✅ Backtesting commands
-- ✅ Estratégias commands
-- ✅ Worker para lifecycle management
-- ✅ Enums para estados del bot
-- ✅ DataProvider para estrategias
-- ✅ Exchange wrapper (CCXT)
-- ✅ IStrategy base class
-- ✅ Strategy loader dinámico
-- ✅ DefaultStrategy template
-- ✅ Backtesting engine
-- ✅ Backtesting reports (JSON, texto)
-- ✅ CLI backtesting commands
-- ✅ FreqAI (Machine Learning)
-- ✅ Data Kitchen para ML
-- ✅ Modelos: LightGBM, XGBoost, RandomForest
-- ✅ Feature Engineering automático
-- ✅ Telegram Bot
-- ✅ API Server (REST)
-- ✅ WebSocket
-- ✅ Notifications System
-- ✅ RPC Manager
-
----
-
-## 🖥️ Línea de Comandos (CLI)
-
-Reco-Trading incluye una CLI completa similar a FreqTrade:
-
-```bash
-# Iniciar el bot
-reco-trade trade start --config config.json
-
-# Ver estado
-reco-trade trade status
-
-# Detener el bot
-reco-trade trade stop
-
-# Ejecutar backtesting
-reco-trade backtesting start --strategy MyStrategy --timeframe 5m
-
-# Crear config por defecto
-reco-trade init-config
-
-# Listar estrategias disponibles
-reco-trade list-strategies
-
-# Listar exchanges soportados
-reco-trade list-exchanges
-```
-
-### Comandos Disponibles
-
-| Comando | Descripción |
-|---------|-------------|
-| `trade start` | Iniciar el bot de trading |
-| `trade stop` | Detener el bot |
-| `trade status` | Ver estado del bot |
-| `trade reload-config` | Recargar configuración |
-| `backtesting start` | Ejecutar backtesting |
-| `backtesting show` | Mostrar resultados |
-| `init-config` | Crear config por defecto |
-| `list-strategies` | Listar estrategias |
-| `list-exchanges` | Listar exchanges |
-
----
-
-## 📈 Desarrollo de Estrategias
-
-Reco-Trading utiliza un sistema de estrategias basado en IStrategy:
-
-```python
-from reco_trading.strategy import IStrategy
-
-class MiEstrategia(IStrategy):
-    # Configuración
-    timeframe = "5m"
-    stoploss = -0.10
-    minimal_roi = {"0": 0.10}
-    
-    def populate_indicators(self, dataframe, metadata):
-        # Añadir indicadores
-        dataframe["rsi"] = self._rsi(dataframe["close"])
-        return dataframe
-    
-    def populate_entry_trend(self, dataframe, metadata):
-        # Señales de entrada
-        dataframe["enter_long"] = 0
-        dataframe.loc[dataframe["rsi"] < 30, "enter_long"] = 1
-        return dataframe
-    
-    def populate_exit_trend(self, dataframe, metadata):
-        # Señales de salida
-        dataframe["exit_long"] = 0
-        dataframe.loc[dataframe["rsi"] > 70, "exit_long"] = 1
-        return dataframe
-```
-
-### Atributos de Estrategia
-
-| Atributo | Descripción |
-|----------|-------------|
-| `timeframe` | Timeframe (1m, 5m, 15m, 1h, etc.) |
-| `stoploss` | Stop loss como ratio negativo |
-| `minimal_roi` | Tabla de ROI mínimo |
-| `trailing_stop` | Habilitar trailing stop |
-| `max_open_trades` | Máx. trades abiertos |
-
-### Métodos Required
-
-- `populate_indicators()` - Añadir indicadores técnicos
-- `populate_entry_trend()` - Señales de entrada
-- `populate_exit_trend()` - Señales de salida
-
----
-
-## 🔬 Backtesting
-
-Reco-Trading incluye un motor de backtesting para probar estrategias:
-
-```bash
-# Ejecutar backtesting
-reco-trade backtesting start --strategy DefaultStrategy --timeframe 5m
-
-# Mostrar resultados guardados
-reco-trade backtesting show results.json
-
-# Listar resultados
-reco-trade backtesting list
-```
-
-### Métricas de Backtesting
-
-| Métrica | Descripción |
-|---------|-------------|
-| Total Trades | Número total de trades ejecutados |
-| Winning Trades | Trades con profit positivo |
-| Losing Trades | Trades con profit negativo |
-| Win Rate | Porcentaje de trades ganadores |
-| Total Profit | Ganancia total en stake currency |
-| Max Drawdown | Drawdown máximo durante la simulación |
-| Avg Duration | Duración promedio de trades |
-
-### Reportes
-
-Los resultados se pueden exportar en JSON:
-
-```python
-from reco_trading.backtesting.reports import store_backtest_results
-
-store_backtest_results(results, "backtest_results/my_strategy.json")
-```
-
----
-
-## 🤖 FreqAI - Machine Learning
-
-Reco-Trading incluye FreqAI para predicción con Machine Learning:
-
-```python
-# Configuración en config.json
-{
-    "freqai": {
-        "enabled": true,
-        "model": "LightGBMClassifier",
-        "train_period_days": 14,
-        "labeling": {
-            "type": "binary",
-            "threshold": 0.02
-        }
-    }
-}
-```
-
-### Modelos Soportados
-
-| Modelo | Descripción |
-|--------|-------------|
-| LightGBMClassifier | Clasificador basado en árboles |
-| XGBoostClassifier | Clasificador XGBoost |
-| RandomForest | Random Forest classifier |
-
-### Feature Engineering
-
-El sistema genera automáticamente:
-- Medias móviles (SMA, EMA)
-- RSI y MACD
-- Bollinger Bands
-- Features de volumen
-- Features desplazados (lagged)
-
-### Uso
-
-```python
-from reco_trading.freqai import FreqAI
-
-freqai = FreqAI(config)
-await freqai.start()
-predictions = await freqai.predict(dataframe)
-```
-
----
-
-## 📱 Telegram Bot
-
-Reco-Trading incluye un bot de Telegram para control remoto:
-
-```json
-{
-    "telegram": {
-        "enabled": true,
-        "token": "YOUR_BOT_TOKEN",
-        "chat_id": "YOUR_CHAT_ID"
-    }
-}
-```
-
-### Comandos Disponibles
-
-| Comando | Descripción |
-|--------|-------------|
-| /start | Iniciar bot |
-| /stop | Detener bot |
-| /status | Ver estado |
-| /profit | Ver ganancias |
-| /balance | Ver balance |
-| /trades | Ver trades recientes |
-| /reload | Recargar config |
-| /help | Ver ayuda |
-
----
-
-## 🌐 API Server
-
-API REST con FastAPI:
-
-```bash
-# Endpoints principales
-GET /api/v1/status     # Estado del bot
-GET /api/v1/balance    # Balance de cuenta
-GET /api/v1/trades     # Historial de trades
-GET /api/v1/open-trades # Trades abiertos
-GET /api/v1/stats      # Estadísticas
-GET /api/v1/config     # Configuración
-GET /api/v1/pairs     # Lista de pares
-GET /ws               # WebSocket para datos en tiempo real
-```
-
-### Documentación
-
-Accede a `/docs` para ver la documentación Swagger.
-
----
-
-## 🔔 Notificaciones
-
-Sistema de notificaciones integrado:
-
-- Telegram
-- Webhooks
-- Notificaciones de entry/exit
-- Alertas de protecciones
-- Errores y warnings
-
-```python
-from reco_trading.rpc import NotificationManager
-
-notifications = NotificationManager(config)
-await notifications.notify_entry(trade)
-await notifications.notify_exit(trade)
-```
-
----
-
-## ⚠️ Disclaimer
-
-Este bot es para fines educativos. Úsalo bajo tu propio riesgo. Siempre haz pruebas en testnet antes de usar dinero real.
-
----
-
-## 📧 Soporte
-
-- GitHub: [reco-trading](https://github.com)
-- Issues: Reporta errores y sugerencias
+Este software es educativo/técnico y **no constituye asesoramiento financiero**. Operar cripto implica alto riesgo. Usa testnet y gestión de riesgo estricta antes de operar en real.

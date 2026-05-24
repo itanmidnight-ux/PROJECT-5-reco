@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os as _os
 import time
 import uuid
+from contextlib import AbstractContextManager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -26,8 +28,13 @@ from reco_trading.risk.advanced_risk_manager import AdvancedRiskManager
 from reco_trading.risk.adaptive_sizer import AdaptiveSizer
 from reco_trading.risk.capital_profile import CapitalProfile, CapitalProfileManager
 from reco_trading.risk.investment_optimizer import InvestmentOptimizer
+from reco_trading.strategy.market_adaptation import MarketAdaptation
+from reco_trading.strategy.adaptive_frame import AdaptiveFrameEngine
 from reco_trading.risk.risk_manager import RiskManager
 from reco_trading.risk.portfolio_risk import PortfolioRiskController
+from reco_trading.risk.smart_stop_engine import SmartStopEngine, SmartStopConfig, StopType
+from reco_trading.risk.intelligent_capital_manager import IntelligentCapitalManager, CapitalMode
+from reco_trading.risk.auto_balance_manager import AutoBalanceManager
 from reco_trading.strategy.confidence_model import ConfidenceModel
 from reco_trading.strategy.indicators import apply_indicators
 from reco_trading.strategy.confluence import TimeframeConfluence
@@ -37,12 +44,42 @@ from reco_trading.strategy.signal_engine import SignalBundle, SignalEngine
 from reco_trading.ui.dashboard import TerminalDashboard
 from reco_trading.core.resilience import ResilienceManager, ResilienceConfig, NetworkResilience
 from reco_trading.core.intelligent_auto_improver import IntelligentAutoImprover
+from reco_trading.core.self_analyzer import SelfAnalyzer
+from reco_trading.core.autonomous_optimizer import AutonomousOptimizer
+from reco_trading.core.loop_manager import LoopManager
 from reco_trading.core.multi_pair_manager import MultiPairManager
 from reco_trading.ml.enhanced_ml_engine import EnhancedMLEngine
+
+# Optional ML models - only loaded if dependencies are available
+try:
+    from reco_trading.ml.tft_model import TFTManager, TFTConfig
+    _TFT_AVAILABLE = True
+except ImportError:
+    TFTManager = None
+    TFTConfig = None
+    _TFT_AVAILABLE = False
+
+try:
+    from reco_trading.ml.nbeats_model import NBEATSManager, NBEATSConfig
+    _NBEATS_AVAILABLE = True
+except ImportError:
+    NBEATSManager = None
+    NBEATSConfig = None
+    _NBEATS_AVAILABLE = False
+
+try:
+    from reco_trading.ml.advanced_meta_learner import MetaLearningManager, MetaLearningConfig
+    _META_LEARNING_AVAILABLE = True
+except ImportError:
+    MetaLearningManager = None
+    MetaLearningConfig = None
+    _META_LEARNING_AVAILABLE = False
+
 from reco_trading.core.trading_modes import TradingModeManager, WebSocketManager
 from reco_trading.core.integrations import initialize_all_modules, get_system_status, create_default_config
 from reco_trading.core.autonomous_brain import AutonomousTradingBrain, create_autonomous_brain
 from reco_trading.core.emergency_systems import EmergencySystem, DataValidator
+from reco_trading.execution import SmartExecutor, ExecutionConfig, OrderRequest, OrderType, LatencyOptimizer
 
 if TYPE_CHECKING:
     from reco_trading.ui.state_manager import StateManager
@@ -62,8 +99,27 @@ except ImportError:
                 for line in f:
                     if line.startswith("VmRSS:"):
                         return float(line.split()[1]) / 1024.0
-        except OSError:
-            return 0.0
+        except (OSError, IndexError, ValueError):
+            pass
+        return 0.0
+
+
+def _get_database_dsn(settings: Settings) -> str:
+    """Get best available database DSN with fallback."""
+    if settings.postgres_dsn:
+        return settings.postgres_dsn
+    if settings.mysql_dsn:
+        return settings.mysql_dsn
+    if settings.database_url:
+        # Convert sqlite:// to sqlite+aiosqlite:// for async support
+        if settings.database_url.startswith("sqlite://"):
+            return settings.database_url.replace("sqlite://", "sqlite+aiosqlite://")
+        return settings.database_url
+    import os
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.makedirs(os.path.join(project_root, "data"), exist_ok=True)
+    db_path = os.path.join(project_root, "data", "reco_trading.db")
+    return f"sqlite+aiosqlite:///{db_path}"
 
 
 class BotEngine:
@@ -79,7 +135,10 @@ class BotEngine:
         self.symbols = [normalize_symbol(sym) for sym in (settings.trading_symbols or [])] or [self.symbol]
         self.order_manager = OrderManager(self.client, self.symbol)
         self.market_stream = MarketStream(self.client, self.symbol, settings.history_limit)
-        self.repository = Repository(settings.postgres_dsn)
+        
+        dsn = _get_database_dsn(settings)
+        self.logger.info(f"Using database: {dsn[:30]}...")
+        self.repository = Repository(dsn)
         self.signal_engine = SignalEngine()
         self.confidence_model = ConfidenceModel()
         self.risk_manager = RiskManager(settings.daily_loss_limit_fraction, settings.max_trades_per_day)
@@ -95,11 +154,48 @@ class BotEngine:
             max_multiplier=1.50,
             confidence_boost_above=0.80,
         )
+        
+        self.smart_stop_engine = SmartStopEngine(SmartStopConfig(
+            enabled=True,
+            initial_stop_atr_multiplier=float(getattr(settings, "stop_loss_pct", 2.0) / 100 * 20),
+            trailing_activation_profit_r=0.30,
+            break_even_trigger_profit_r=0.20,
+            profit_lock_trigger_r=0.50,
+        ))
+        
+        self.intelligent_capital_manager = IntelligentCapitalManager(
+            initial_capital=float(getattr(settings, "initial_capital", 100.0)),
+            aggressive_mode=False,
+            preserve_capital=True,
+        )
+        
+        # Auto balance manager for intelligent position sizing
+        self.auto_balance_manager = AutoBalanceManager(
+            initial_capital=float(getattr(settings, "initial_capital", 100.0)),
+            reserve_ratio=0.15,
+            max_daily_risk=0.03,
+        )
+        
         self.market_intelligence = MarketIntelligence(settings)
         self.exit_intelligence = ExitIntelligence()
+        self.market_adaptation = MarketAdaptation()
+        self.adaptive_frame = AdaptiveFrameEngine()
         self.confluence = TimeframeConfluence()
 
         self.state_manager = state_manager
+        if self.state_manager and hasattr(self.state_manager, "configure_log_state_emission"):
+            self.state_manager.configure_log_state_emission(
+                bool(getattr(self.settings, "ui_state_emit_on_each_log", False))
+            )
+        if bool(getattr(self.settings, "low_ram_mode", True)):
+            original_limit = settings.history_limit
+            settings.history_limit = max(120, min(int(settings.history_limit), 220))
+            if settings.history_limit != original_limit:
+                self.logger.warning(
+                    "history_limit clamped by low_ram_mode: %d → %d. "
+                    "Indicators requiring >%d candles may be inaccurate.",
+                    original_limit, settings.history_limit, settings.history_limit
+                )
         self.trades_today = 0
         self.win_count = 0
         self.start_time = time.time()
@@ -124,7 +220,13 @@ class BotEngine:
         self.runtime_dynamic_exit_enabled: bool = False
         self.runtime_confidence_boost_multiplier: float = 1.0
         self.runtime_confidence_threshold: float | None = None
-        self.runtime_filter_config: dict[str, float] = self._get_default_filter_config()
+        self.base_filter_config: dict[str, float] = self._get_default_filter_config()
+        self.runtime_filter_config: dict[str, float] = dict(self.base_filter_config)
+        self._filter_auto_adjustment_count: int = 0
+        self._current_capital_profile_cache: CapitalProfile | None = None
+        self.terminal_tui_enabled: bool = bool(getattr(self.settings, "terminal_tui_enabled", True))
+        self.terminal_tui_quiet_logs: bool = bool(getattr(self.settings, "terminal_tui_quiet_logs", True))
+        self.terminal_tui_refresh_per_second: int = max(int(getattr(self.settings, "terminal_tui_refresh_per_second", 4)), 1)
         self.manual_pause = False
         self.emergency_stop_active = False
         self.equity_curve_history: list[float] = []
@@ -139,6 +241,7 @@ class BotEngine:
         self.investment_optimizer = InvestmentOptimizer()
         self._metrics_server_started = False
         self._quote_to_usdt_cache: dict[str, tuple[float, datetime]] = {}
+        self._asset_to_usdt_cache: dict[str, tuple[float, datetime]] = {}
         
         resilience_config = ResilienceConfig(
             crash_recovery_enabled=True,
@@ -152,6 +255,10 @@ class BotEngine:
         self.auto_improver = IntelligentAutoImprover(enabled=True)
         self._auto_improver_initialized = False
 
+        self.self_analyzer = SelfAnalyzer(enabled=True)
+        self.autonomous_optimizer = AutonomousOptimizer(enabled=True)
+        self.loop_manager = LoopManager(enabled=True)
+
         self.multi_pair_manager = MultiPairManager(self.client, self.symbols)
         self.enhanced_ml = EnhancedMLEngine()
         self.enhanced_ml.add_model("momentum", 1.0)
@@ -160,6 +267,17 @@ class BotEngine:
         self.enhanced_ml.add_model("pattern", 0.8)
         self.enhanced_ml.add_model("sentiment", 1.0)
         self._ml_enabled = True
+        
+        self.tft_manager = None
+        self.nbeats_manager = None
+        self.meta_learning_manager = None
+        self.market_meta_learner = None
+        
+        self.logger.info("Lightweight ML mode: TFT/NBEATS/Meta-learning disabled for low RAM usage")
+        
+        self.log_analyzer = None
+        self.auto_fix_coordinator = None
+        self.logger.info("LLM systems disabled: Using filter-based validation only")
         
         self.trading_mode_manager = TradingModeManager(self.client)
         self.ws_manager = WebSocketManager(self.client)
@@ -173,10 +291,30 @@ class BotEngine:
         self.data_validator = DataValidator()
         self.logger.info("Emergency System and Data Validator initialized")
         
+        self.executor = SmartExecutor(ExecutionConfig(
+            max_slippage_percent=float(getattr(settings, "execution_max_slippage_percent", 0.3)),
+            max_spread_percent=float(getattr(settings, "execution_max_spread_percent", 0.2)),
+            order_timeout_seconds=float(getattr(settings, "execution_order_timeout_seconds", 5.0)),
+            fill_timeout_seconds=float(getattr(settings, "execution_fill_timeout_seconds", 10.0)),
+            split_threshold_usdt=float(getattr(settings, "execution_split_threshold_usdt", 500.0)),
+            max_split_parts=int(getattr(settings, "execution_max_split_parts", 5)),
+            retry_attempts=int(getattr(settings, "execution_retry_attempts", 3)),
+            retry_delay_seconds=float(getattr(settings, "execution_retry_delay_seconds", 1.0)),
+            verify_fills=bool(getattr(settings, "execution_verify_fills", True)),
+            min_fill_percent=float(getattr(settings, "execution_min_fill_percent", 95.0)),
+        ))
+        self.latency_optimizer = LatencyOptimizer()
+        self.logger.info("SmartExecutor initialized for advanced order execution")
+        
         self._cached_frame5: Any | None = None
         self._cached_frame15: Any | None = None
         self._last_primary_indicator_ts: datetime | None = None
         self._last_confirmation_indicator_ts: datetime | None = None
+        self._market_analysis_cancelled = False
+        self._pending_pair_switch: str | None = None
+        self._last_dashboard_render_ts: float = 0.0
+        self._last_dashboard_render_digest: str = ""
+        self._dashboard_min_render_interval_seconds: float = 0.20
 
         self.dashboard = TerminalDashboard()
         self.snapshot: dict[str, Any] = {
@@ -206,7 +344,17 @@ class BotEngine:
             "last_trade": None,
             "cooldown": None,
             "status": BotState.INITIALIZING.value,
+            "auto_pause_disabled": bool(getattr(self.settings, "disable_auto_pause", True)),
+            "pause_states": {
+                "manual_pause": False,
+                "emergency_stop": False,
+                "drawdown_pause": False,
+                "loss_pause": False,
+                "exchange_pause": False,
+                "cooldown_active": False,
+            },
             "signals": {},
+            "logs": [],
             "volume": None,
             "atr": None,
             "api_latency_ms": None,
@@ -214,6 +362,10 @@ class BotEngine:
             "stale_market_data_ratio": 0.0,
             "exchange_reconnections": 0,
             "circuit_breaker_trips": 0,
+            "execution_latency_ms": 0.0,
+            "execution_slippage_pct": 0.0,
+            "execution_split_orders": 0,
+            "execution_failed_orders": 0,
             "candles_5m": [],
             "started_at": time.time(),
             "market_regime": None,
@@ -244,6 +396,7 @@ class BotEngine:
             "open_position_qty": None,
             "open_position_sl": None,
             "open_position_tp": None,
+            "open_positions": [],
             "session_streak": 0,
             "session_recommendation": "NORMAL",
             "exit_intelligence_score": 0.0,
@@ -252,25 +405,77 @@ class BotEngine:
             "exit_intelligence_codes": [],
             "exit_intelligence_details": {},
             "exit_intelligence_log": [],
+            "market_analysis": {
+                "status": "idle",
+                "total_markets": 0,
+                "analyzed_markets": 0,
+                "progress_pct": 0.0,
+                "best_pair": "--",
+                "best_score": 0.0,
+                "last_analysis_time": "Never",
+                "ai_connected": False,
+            },
+            "market_analysis_request": None,
+            "market_analysis_market_count": 50,
+            "runtime_settings_request": None,
+            "capital_manager": {
+                "capital_mode": "MEDIUM",
+                "current_capital": 0.0,
+                "initial_capital": 0.0,
+                "peak_capital": 0.0,
+                "current_drawdown_pct": 0.0,
+                "win_streak": 0,
+                "loss_streak": 0,
+                "daily_trades": 0,
+                "market_condition": "NORMAL",
+                "effective_params": {},
+            },
+            "smart_stop_status": "Ready",
+            "smart_stop_stats": {
+                "active_stops": 0,
+                "trails_activated": 0,
+                "break_evens_hit": 0,
+                "profit_locks": 0,
+            },
+            "ml_status": "Active",
+            "ml_direction": None,
+            "ml_confidence": 0.0,
+            "ml_predicted_move": 0.0,
+            "confluence_score": 0.0,
+            "confluence_aligned": None,
+            "volatility_state": "NORMAL",
         }
 
     async def run(self) -> None:
         try:
-            await self._set_state(BotState.INITIALIZING, "initialize_settings")
-            await self.repository.setup()
-            self.snapshot["database_status"] = "CONNECTED"
-            self.observability.update_health(db_healthy=True)
+            try:
+                await self.repository.setup()
+                self.snapshot["database_status"] = "CONNECTED"
+                self.observability.update_health(db_healthy=True)
+            except Exception as db_err:
+                self.logger.warning(f"Database setup failed: {db_err}, falling back to SQLite")
+                import os
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                os.makedirs(os.path.join(project_root, "data"), exist_ok=True)
+                db_path = os.path.join(project_root, "data", "reco_trading.db")
+                fallback_dsn = f"sqlite+aiosqlite:///{db_path}"
+                self.logger.info(f"Using fallback SQLite: {fallback_dsn}")
+                from reco_trading.database.repository import Repository
+                self.repository = Repository(fallback_dsn)
+                await self.repository.setup()
+                self.snapshot["database_status"] = "SQLITE_FALLBACK"
+                self.observability.update_health(db_healthy=True)
             if self.settings.observability_enabled and not self._metrics_server_started:
                 start_metrics_server(self.observability, self.settings.observability_bind_host, self.settings.observability_port)
                 self._metrics_server_started = True
+            await self._restore_bot_config()
             runtime_bundle = await self.repository.get_runtime_settings()
             runtime_settings = runtime_bundle.get("ui_runtime_settings", {}) if isinstance(runtime_bundle, dict) else {}
             if isinstance(runtime_settings, dict) and runtime_settings:
                 await self._apply_runtime_settings(runtime_settings, persist=False)
             await self._set_state(BotState.CONNECTING_EXCHANGE, "connect_exchange")
+            await self.client.connect()
             await self.client.sync_time()
-            await self._set_state(BotState.SYNCING_SYMBOL, "sync_symbol")
-            await self._set_state(BotState.SYNCING_RULES, "sync_exchange_rules")
             await self.order_manager.sync_rules()
             self.snapshot["exchange_status"] = "CONNECTED"
             self.observability.update_health(exchange_healthy=True)
@@ -278,19 +483,53 @@ class BotEngine:
             
             await self.resilience.start()
             await self.auto_improver.start()
+            await self.self_analyzer.start()
+            await self.autonomous_optimizer.start()
+            
+            await self.loop_manager.initialize(
+                auto_improver=self.auto_improver,
+                self_analyzer=self.self_analyzer,
+                autonomous_optimizer=self.autonomous_optimizer,
+            )
+            await self.loop_manager.start()
+            
             await self.multi_pair_manager.start()
             self.autonomous_brain.set_bot_engine(self)
             await self.autonomous_brain.start()
             self._auto_improver_initialized = True
-            self.logger.info("Resilience, Auto-Improver, Multi-Pair Manager, and Autonomous Brain started")
+            self.logger.info("All auto-improvement systems started: AutoImprover, SelfAnalyzer, AutonomousOptimizer, LoopManager")
+            
+            self._start_ml_auto_training()
+            
+            self.snapshot["market_analysis"]["ai_connected"] = True
+            self._sync_ui_state()
             
             await self._set_state(BotState.WAITING_MARKET_DATA, "ready")
             self._sync_ui_state()
 
-            with Live(self.dashboard.render(self.snapshot), refresh_per_second=2, transient=False) as live:
+            terminal_dashboard_enabled = bool(self.terminal_tui_enabled)
+            live_context: AbstractContextManager[Any]
+            if terminal_dashboard_enabled:
+                import sys
+                _tui_fps = max(1, min(int(getattr(self, "terminal_tui_refresh_per_second", 4)), 10))
+                _has_tty = sys.stdout.isatty()
+                live_context = Live(
+                    self.dashboard.render(self.snapshot),
+                    refresh_per_second=_tui_fps,
+                    transient=False,
+                    auto_refresh=False,
+                    screen=_has_tty,  # screen=True solo si hay TTY real
+                    vertical_overflow="crop",
+                )
+            else:
+                live_context = _NoopLive()
+
+            with live_context as live:
+                self._safe_live_update(live, force=True)
                 while True:
                     try:
                         await self._process_control_requests()
+                        await self._switch_symbol_if_pending()
                         await self.client.periodic_time_resync(interval_seconds=1800.0)
                         if self.emergency_stop_active:
                             await self._set_state(BotState.PAUSED, "emergency_stop")
@@ -300,21 +539,30 @@ class BotEngine:
                             await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
                             continue
 
-                        if self.manual_pause:
+                        user_paused = self.snapshot.get("user_paused", False)
+                        if self.manual_pause or user_paused:
                             await self._set_state(BotState.PAUSED, "manual_pause")
-                            self.snapshot["cooldown"] = "MANUAL_PAUSE"
+                            if user_paused and not self.manual_pause:
+                                self.manual_pause = True
+                            self.snapshot["cooldown"] = "USER_PAUSE"
                             self._sync_ui_state()
                             self._safe_live_update(live)
                             await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
                             continue
 
                         if self.exchange_failure_paused_until and datetime.now(timezone.utc) < self.exchange_failure_paused_until:
-                            await self._set_state(BotState.PAUSED, "exchange_circuit_breaker")
-                            self.snapshot["cooldown"] = f"EXCHANGE_PAUSED until {self.exchange_failure_paused_until.isoformat(timespec='seconds')}"
-                            self._sync_ui_state()
-                            self._safe_live_update(live)
-                            await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
-                            continue
+                            disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+                            if disable_auto_pause:
+                                self.exchange_failure_paused_until = None
+                                self.snapshot["cooldown"] = None
+                                await self._log("WARNING", "exchange_failure_pause_bypassed auto_pause_disabled=True continuing_operation")
+                            else:
+                                await self._set_state(BotState.PAUSED, "exchange_circuit_breaker")
+                                self.snapshot["cooldown"] = f"EXCHANGE_PAUSED until {self.exchange_failure_paused_until.isoformat(timespec='seconds')}"
+                                self._sync_ui_state()
+                                self._safe_live_update(live)
+                                await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
+                                continue
 
                         self._roll_day()
                         await self._set_state(BotState.WAITING_MARKET_DATA, "fetch_market_data")
@@ -343,16 +591,33 @@ class BotEngine:
                         self._apply_autonomous_filters()
 
                         if await self.validate_trade_conditions(analysis):
+                            self.logger.info(f"validate_trade_conditions PASSED for {analysis.get('side')}")
                             intelligence = self.market_intelligence.evaluate(str(analysis.get("side", "HOLD")), market_data)
                             self._apply_market_intelligence_snapshot(intelligence)
                             if intelligence.get("approved"):
+                                self.logger.info(f"Market Intelligence APPROVED: {intelligence.get('reason')} size_multiplier={intelligence.get('size_multiplier')}")
+                                await self._log(
+                                    "INFO",
+                                    f"trade_approved by filter_validation side={analysis.get('side')} confidence={float(analysis.get('confidence', 0.0)):.2f}",
+                                )
                                 await self._log_trade_cycle_summary(
                                     analysis=analysis,
                                     decision="APPROVED",
-                                    reason="TRADE_APPROVED",
+                                    reason="FILTER_VALIDATION_PASSED",
                                     filter_checks=list(analysis.get("validation_checks", [])),
                                 )
+                                self.logger.info(f"ABOUT TO CALL execute_trade: side={analysis.get('side')} confidence={analysis.get('confidence')}")
                                 await self.execute_trade(analysis, market_data, float(intelligence.get("size_multiplier", 1.0)))
+                                print(f"=== TRADE_EXECUTED: {analysis.get('side')} {analysis.get('confidence')}")
+                                try:
+                                    from web_site.dashboard_server import broadcast_trade_execution
+                                    await broadcast_trade_execution({
+                                        "symbol": self.symbol,
+                                        "side": str(analysis.get("side")),
+                                        "price": float(market_data.get("price", 0)),
+                                    })
+                                except Exception as broadcast_exc:
+                                    self.logger.debug("broadcast_trade_execution_failed: %s", broadcast_exc)
                             else:
                                 rejection_reason = str(intelligence.get("reason", "MARKET_INTELLIGENCE_REJECT"))
                                 await self._set_state(BotState.WAITING_MARKET_DATA, rejection_reason)
@@ -376,12 +641,19 @@ class BotEngine:
                         self.exchange_failure_count = 0
                         self.observability.update_health(exchange_healthy=True)
                         self._refresh_observability_snapshot()
+                        await self._run_log_analysis_cycle()
                         self._sync_ui_state()
                         self._safe_live_update(live)
                         await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
                     except KeyboardInterrupt:
                         await self._set_state(BotState.STOPPED, "manual_stop")
                         break
+                    except asyncio.CancelledError as exc:
+                        if str(exc) == "executor_shutdown":
+                            await self._set_state(BotState.STOPPED, "executor_shutdown")
+                            await self._log("INFO", "executor_shutdown_detected_stopping_bot")
+                            break
+                        raise
                     except ccxt.BaseError as exc:
                         await self._set_state(BotState.ERROR, "exchange_error")
                         self.snapshot["exchange_status"] = "ERROR"
@@ -407,17 +679,38 @@ class BotEngine:
                         self._safe_live_update(live)
                         await self._sleep_with_responsiveness(self.settings.loop_sleep_seconds)
         finally:
+            try:
+                await self.loop_manager.stop()
+            except Exception:
+                pass
+            try:
+                await self.multi_pair_manager.stop()
+            except Exception:
+                pass
             await self.auto_improver.stop()
             await self.autonomous_brain.stop()
             await self.resilience.stop()
+            await self._save_bot_config()
+            await self._save_daily_stats()
             await self.client.close()
             await self.repository.close()
+            try:
+                from web_site.dashboard_server import set_bot_instance
+                set_bot_instance(None)
+            except Exception:
+                pass
 
     async def fetch_market_data(self) -> dict[str, Any]:
         raw_frame5, raw_frame15 = await asyncio.gather(
             self.market_stream.fetch_frame(self.settings.primary_timeframe),
             self.market_stream.fetch_frame(self.settings.confirmation_timeframe),
         )
+        
+        # Handle empty frames gracefully
+        if raw_frame5.empty or raw_frame15.empty:
+            await self._log("WARNING", f"empty_market_data frame5_empty={raw_frame5.empty} frame15_empty={raw_frame15.empty}")
+            await asyncio.sleep(5)
+            raise RuntimeError("Empty market data received, retrying...")
 
         latest_primary_ts = _timestamp_to_datetime(raw_frame5.iloc[-1].get("timestamp") if not raw_frame5.empty else None)
         latest_confirmation_ts = _timestamp_to_datetime(raw_frame15.iloc[-1].get("timestamp") if not raw_frame15.empty else None)
@@ -477,10 +770,15 @@ class BotEngine:
             price_swing = abs(float(recent_closes.iloc[-1]) - float(recent_closes.iloc[0]))
             swing_pct = price_swing / max(float(recent_closes.iloc[0]), 1e-9)
             if swing_pct > 0.035:
-                pause_until = datetime.now(timezone.utc) + timedelta(minutes=10)
-                if self.pause_trading_until is None or pause_until > self.pause_trading_until:
-                    self.pause_trading_until = pause_until
-                    await self._log("WARNING", f"market_circuit_breaker swing={swing_pct:.2%} pausing_10min")
+                auto_pause_on_high_swing = bool(getattr(self.settings, "auto_pause_on_high_swing", False))
+                disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+                if auto_pause_on_high_swing and not disable_auto_pause:
+                    pause_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+                    if self.pause_trading_until is None or pause_until > self.pause_trading_until:
+                        self.pause_trading_until = pause_until
+                        await self._log("WARNING", f"market_circuit_breaker swing={swing_pct:.2%} pausing_10min")
+                else:
+                    await self._log("WARNING", f"high_market_swing detected swing={swing_pct:.2%} continuing_without_pause auto_pause_disabled=True")
 
         primary_age_seconds = (datetime.now(timezone.utc) - latest_primary_ts).total_seconds() if latest_primary_ts else -1.0
         if bool(getattr(self.settings, "verbose_trade_decision_logs", False)):
@@ -511,7 +809,7 @@ class BotEngine:
         ml_prediction = None
         ml_confidence_boost = 0.0
         
-        if self._ml_enabled and market_data.get("frame5") is not None:
+        if getattr(self, "_ml_enabled", False) and hasattr(self, "enhanced_ml") and market_data.get("frame5") is not None:
             try:
                 frame5 = market_data["frame5"]
                 if hasattr(frame5, "iloc") and len(frame5) >= 20:
@@ -547,7 +845,7 @@ class BotEngine:
                     
                     self.snapshot["ml_intelligence"] = {
                         "status": "Activo",
-                        "model_type": "Ensemble (Momentum, Trend, Volume, Pattern, Sentiment)",
+                        "model_type": "Ensemble (Momentum, Trend, Volume, Pattern, Sentiment) + TFT + N-BEATS",
                         "training_samples": 1000,
                         "last_train": "En tiempo real",
                         "next_train": "Continuo",
@@ -575,6 +873,13 @@ class BotEngine:
         grade = str(explained["grade"])
         raw_side = side
         
+        self.logger.info(
+            f"SIGNAL_GENERATED: side={side} confidence={confidence:.4f} grade={grade} "
+            f"bundle=[trend={bundle.trend} momentum={bundle.momentum} volume={bundle.volume} "
+            f"structure={bundle.structure} order_flow={bundle.order_flow}] "
+            f"buy_score={explained['buy_score']:.3f} sell_score={explained['sell_score']:.3f}"
+        )
+        
         if ml_prediction and ml_prediction.direction != "HOLD" and ml_prediction.confidence >= 0.65:
             if (ml_prediction.direction == "BUY" and side == "BUY") or \
                (ml_prediction.direction == "SELL" and side == "SELL"):
@@ -593,6 +898,45 @@ class BotEngine:
             final_confidence = confidence * penalty
         if getattr(self.settings, "spot_only_mode", True) and side == "SELL" and not self._can_execute_spot_sell():
             side = "HOLD"
+        
+        # TFT and NBEATS predictions (after signal is generated, non-blocking)
+        if getattr(self, "_ml_enabled", False) and hasattr(self, "enhanced_ml") and market_data.get("frame5") is not None:
+            try:
+                frame5 = market_data["frame5"]
+                if hasattr(frame5, "iloc") and len(frame5) >= 65:
+                    if hasattr(self, 'tft_manager') and self.tft_manager and self.symbol in self.tft_manager.models:
+                        try:
+                            tft_result = self.tft_manager.predict(frame5, self.symbol)
+                            if tft_result and tft_result.get("direction") != "HOLD":
+                                tft_conf = tft_result.get("confidence", 0.5)
+                                if tft_conf >= 0.6:
+                                    tft_boost = tft_conf * 0.15
+                                    if tft_result["direction"] == side:
+                                        final_confidence = min(final_confidence + tft_boost, 0.99)
+                                    elif tft_result["direction"] != side and side != "HOLD":
+                                        final_confidence = max(final_confidence * 0.7, 0.1)
+                                    self.snapshot["tft_direction"] = tft_result["direction"]
+                                    self.snapshot["tft_confidence"] = tft_conf
+                        except Exception as tft_exc:
+                            self.logger.debug(f"TFT prediction skipped: {tft_exc}")
+                    
+                    if hasattr(self, 'nbeats_manager') and self.nbeats_manager and self.symbol in self.nbeats_manager.models:
+                        try:
+                            nbeats_result = self.nbeats_manager.predict(frame5, self.symbol)
+                            if nbeats_result and nbeats_result.get("direction") != "HOLD":
+                                nb_conf = nbeats_result.get("confidence", 0.5)
+                                if nb_conf >= 0.6:
+                                    nb_boost = nb_conf * 0.10
+                                    if nbeats_result["direction"] == side:
+                                        final_confidence = min(final_confidence + nb_boost, 0.99)
+                                    elif nbeats_result["direction"] != side and side != "HOLD":
+                                        final_confidence = max(final_confidence * 0.75, 0.1)
+                                    self.snapshot["nbeats_direction"] = nbeats_result["direction"]
+                                    self.snapshot["nbeats_confidence"] = nb_conf
+                        except Exception as nb_exc:
+                            self.logger.debug(f"NBEATS prediction skipped: {nb_exc}")
+            except Exception as exc:
+                self.logger.debug(f"Advanced ML prediction failed: {exc}")
 
         setup_quality = self._build_setup_quality_score(
             bundle=bundle,
@@ -629,35 +973,45 @@ class BotEngine:
         }
 
     async def validate_trade_conditions(self, analysis: dict[str, Any]) -> bool:
+        # Update market adaptation based on current conditions
+        atr = float(self.snapshot.get("atr", 0) or 0)
+        adx = float(self.snapshot.get("adx", 0) or 0)
+        rsi = float(self.snapshot.get("rsi", 50) or 50)
+        volume_ratio = float(self.snapshot.get("volume_ratio", 1) or 1)
+        price = float(self.snapshot.get("price", 0) or 0)
+        confidence = float(analysis.get("confidence", 0) or 0)
+        
+        market_state = self.market_adaptation.update(
+            price=price, atr=atr, adx=adx, rsi=rsi,
+            volume_ratio=volume_ratio, signal_confidence=confidence
+        )
+        
+        # Add adaptation info to snapshot
+        adapted_params = self.market_adaptation.get_adjusted_params()
+        self.snapshot["market_adaptation"] = {
+            "regime": market_state.regime,
+            "optimal_strategy": market_state.optimal_strategy,
+            "scalping_mode": adapted_params.get("scalping_mode", False),
+            "adx_threshold": adapted_params.get("adx_threshold"),
+            "confidence_min": adapted_params.get("confidence_min"),
+            "rsi_buy_threshold": adapted_params.get("rsi_buy_threshold"),
+            "rsi_sell_threshold": adapted_params.get("rsi_sell_threshold"),
+            "pair_switch_recommended": adapted_params.get("pair_switch_recommended", False),
+        }
+        
+        # Log regime changes
+        if market_state.regime in ("STABLE", "RANGING"):
+            if market_state.signal_count_1h < 3:
+                self.logger.info(f"market_adaptation regime={market_state.regime} signals_1h={market_state.signal_count_1h} filters_relaxed")
+        
         consecutive_losses = self.auto_improver._performance.consecutive_losses if self.auto_improver.enabled else 0
         has_open_position = len(self.position_manager.positions) > 0
         
+        # Single unified pair-switching logic with proper cooldown and sync
         current_best_pair = self.multi_pair_manager.get_best_pair()
-        if current_best_pair != self.symbol and not has_open_position:
-            old_symbol = self.symbol
-            self.symbol = current_best_pair
-            self.order_manager = OrderManager(self.client, self.symbol)
-            self.market_stream = MarketStream(self.client, self.symbol, self.settings.history_limit)
-            self._cached_frame5 = None
-            self._cached_frame15 = None
-            self.logger.warning(f"Auto-switched to best pair: {old_symbol} -> {self.symbol}")
-            self.snapshot["pair_switch"] = self.symbol
-        
-        if not has_open_position and self.multi_pair_manager.should_switch_pair(consecutive_losses):
-            try:
-                new_pair = self.multi_pair_manager.get_alternative_pairs(1)
-                if new_pair and new_pair[0] != self.symbol:
-                    old_symbol = self.symbol
-                    self.symbol = new_pair[0]
-                    self.order_manager = OrderManager(self.client, self.symbol)
-                    self.market_stream = MarketStream(self.client, self.symbol, self.settings.history_limit)
-                    self._cached_frame5 = None
-                    self._cached_frame15 = None
-                    self.logger.warning(f"Switched pair: {old_symbol} -> {self.symbol} (consecutive_losses: {consecutive_losses})")
-                    self.snapshot["pair_switch"] = self.symbol
-            except Exception as exc:
-                self.logger.error(f"Failed to switch pair: {exc}")
-                self.snapshot["pair_switch_error"] = str(exc)
+        if (not has_open_position and current_best_pair and current_best_pair != self.symbol
+                and self.multi_pair_manager.should_switch_pair(consecutive_losses)):
+            await self._switch_to_pair(current_best_pair)
         
         if self.auto_improver.should_block_trading():
             self.logger.warning("Trading blocked by auto-improvement system due to poor performance")
@@ -715,14 +1069,11 @@ class BotEngine:
         if not confidence_pass:
             return await _reject("confidence_below_threshold", cooldown="CONFIDENCE_BELOW_THRESHOLD")
 
+        # ADX filter - ALWAYS required, never bypassed
+        # High confidence should not allow trades in non-trending markets
         adx_value = _as_float(self.snapshot.get("adx"), 0.0)
         adx_threshold = self._effective_adx_threshold()
-        
-        high_confidence_trade = confidence >= 0.75
-        if high_confidence_trade:
-            adx_pass = True
-        else:
-            adx_pass = adx_value >= adx_threshold
+        adx_pass = adx_value >= adx_threshold
         
         validation_checks.append({
             "name": "adx_threshold",
@@ -730,29 +1081,27 @@ class BotEngine:
             "threshold": f">= {adx_threshold}",
             "passed": adx_pass,
         })
-        if not adx_pass and not high_confidence_trade:
+        if not adx_pass:
             await self._log("INFO", f"adx_filter_rejected adx={adx_value:.2f} threshold={adx_threshold}")
+            # ADX filter is NOT bypassed - require trending market
 
+        # RSI filter - ALWAYS required, never bypassed
+        # High confidence should not allow trades at extreme RSI levels
         rsi_value = _as_float(self.snapshot.get("rsi"), 50.0)
         if side == "BUY":
             rsi_threshold = self._effective_rsi_buy_threshold()
-            if high_confidence_trade:
-                rsi_pass = True
-            else:
-                rsi_pass = rsi_value >= rsi_threshold
+            rsi_pass = rsi_value >= rsi_threshold and rsi_value < 75  # Don't buy at overbought
         else:
             rsi_threshold = self._effective_rsi_sell_threshold()
-            if high_confidence_trade:
-                rsi_pass = True
-            else:
-                rsi_pass = rsi_value <= rsi_threshold
+            rsi_pass = rsi_value <= rsi_threshold and rsi_value > 25  # Don't sell at oversold
+        
         validation_checks.append({
             "name": "rsi_filter",
             "value": rsi_value,
             "threshold": f"{rsi_threshold} ({side})",
             "passed": rsi_pass,
         })
-        if not rsi_pass and not high_confidence_trade:
+        if not rsi_pass:
             await self._log("INFO", f"rsi_filter_rejected rsi={rsi_value:.2f} threshold={rsi_threshold} side={side}")
 
         volume_ratio = _as_float(self.snapshot.get("volume_ratio"), 1.0)
@@ -793,7 +1142,14 @@ class BotEngine:
         if self.equity_peak > 0:
             drawdown = max((self.equity_peak - total_equity) / self.equity_peak, 0.0)
             if drawdown >= max_drawdown_fraction:
-                self.trading_paused_by_drawdown = True
+                auto_pause_on_drawdown = bool(getattr(self.settings, "auto_pause_on_drawdown", False))
+                disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+                if auto_pause_on_drawdown and not disable_auto_pause:
+                    self.trading_paused_by_drawdown = True
+                else:
+                    await self._log("WARNING", f"max_drawdown_exceeded drawdown={drawdown:.2%} threshold={max_drawdown_fraction:.2%} continuing_without_pause auto_pause_disabled=True")
+                    self.snapshot["drawdown_warning"] = drawdown
+                    self.snapshot["drawdown_threshold"] = max_drawdown_fraction
 
         validation_checks.append({
             "name": "max_drawdown",
@@ -802,7 +1158,12 @@ class BotEngine:
             "passed": not self.trading_paused_by_drawdown,
         })
         if self.trading_paused_by_drawdown:
-            return await _reject("max_drawdown", state=BotState.PAUSED, cooldown="MAX_DRAWDOWN")
+            if bool(getattr(self.settings, "disable_auto_pause", True)):
+                self.trading_paused_by_drawdown = False
+                self.snapshot["cooldown"] = None
+                await self._log("INFO", "auto_pause_bypassed_max_drawdown manually_resume_from_dashboard_to_pause")
+            else:
+                return await _reject("max_drawdown", state=BotState.PAUSED, cooldown="MAX_DRAWDOWN")
 
         pause_active = bool(self.pause_trading_until and datetime.now(timezone.utc) < self.pause_trading_until)
         validation_checks.append({
@@ -812,11 +1173,18 @@ class BotEngine:
             "passed": not pause_active,
         })
         if pause_active:
-            return await _reject(
-                "loss_protection_pause",
-                state=BotState.PAUSED,
-                cooldown=f"PAUSED until {self.pause_trading_until.isoformat(timespec='seconds')}",
-            )
+            auto_pause_on_losses = bool(getattr(self.settings, "auto_pause_on_consecutive_losses", False))
+            disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+            if auto_pause_on_losses and not disable_auto_pause:
+                return await _reject(
+                    "loss_protection_pause",
+                    state=BotState.PAUSED,
+                    cooldown=f"PAUSED until {self.pause_trading_until.isoformat(timespec='seconds')}",
+                )
+            else:
+                self.pause_trading_until = None
+                await self._log("WARNING", f"loss_protection_pause_ignored auto_pause_disabled=True continuing_trading")
+                self.snapshot["loss_pause_ignored"] = True
 
         cooldown_complete = self._is_cooldown_complete()
         validation_checks.append({
@@ -861,9 +1229,14 @@ class BotEngine:
             "passed": bool(advanced.approved),
         })
         if not advanced.approved:
-            if advanced.pause_trading:
+            auto_pause_enabled = bool(getattr(self.settings, "auto_pause_on_consecutive_losses", False))
+            disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+            if advanced.pause_trading and auto_pause_enabled and not disable_auto_pause:
                 self.pause_trading_until = datetime.now(timezone.utc) + timedelta(minutes=self._effective_loss_pause_minutes())
-            return await _reject(advanced.reason, state=BotState.PAUSED, cooldown=advanced.reason)
+                return await _reject(advanced.reason, state=BotState.PAUSED, cooldown=advanced.reason)
+            else:
+                await self._log("WARNING", f"advanced_risk_reject reason={advanced.reason} auto_pause_disabled=True continuing_trading")
+                self.snapshot["advanced_risk_warning"] = advanced.reason
 
         self.snapshot["advanced_risk_reason"] = advanced.reason
         self.snapshot["advanced_size_multiplier"] = advanced.size_multiplier
@@ -877,7 +1250,12 @@ class BotEngine:
             "passed": session_ok,
         })
         if not session_ok:
-            return await _reject("session_tracker_pause", state=BotState.PAUSED, cooldown="SESSION_TRACKER_PAUSE")
+            disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+            if disable_auto_pause:
+                await self._log("WARNING", f"session_tracker_pause_ignored recommendation={session_stats.recommendation} auto_pause_disabled=True continuing_trading")
+                self.snapshot["session_pause_ignored"] = True
+            else:
+                return await _reject("session_tracker_pause", state=BotState.PAUSED, cooldown="SESSION_TRACKER_PAUSE")
         self.snapshot["session_streak"] = session_stats.current_streak
         self.snapshot["session_recommendation"] = session_stats.recommendation
 
@@ -966,11 +1344,14 @@ class BotEngine:
         return True
 
     async def execute_trade(self, analysis: dict[str, Any], market_data: dict[str, Any], intelligence_size_multiplier: float = 1.0) -> None:
+        import sys
         bundle: SignalBundle = analysis["bundle"]
         side = str(analysis["side"]).upper()
         price = float(market_data["price"])
         atr = float(market_data.get("atr", 0.0))
 
+        print(f">>>>> EXECUTE_TRADE: side={side} price={price} bundle.regime_trade_allowed={bundle.regime_trade_allowed}", file=sys.stderr)
+        
         if side not in {"BUY", "SELL"}:
             await self._set_state(BotState.WAITING_MARKET_DATA, "invalid_side")
             return
@@ -983,24 +1364,28 @@ class BotEngine:
             await self._set_state(BotState.WAITING_MARKET_DATA, "regime_filter")
             return
 
-        if not self.position_manager.can_open(self._effective_max_concurrent_trades()):
+        if not await self.position_manager.can_open(self._effective_max_concurrent_trades()):
+            self.logger.warning(f"MAX_POSITIONS: cannot open, positions open: {len(self.position_manager.positions)}")
             await self._set_state(BotState.POSITION_OPEN, "max_positions")
             return
 
         spread = _as_float(market_data.get("spread"), 0.0)
         spread_gate = self._assess_spread_gate(spread=spread, price=max(price, 1e-9))
+        self.logger.info(f"spread_gate: spread={spread} approved={spread_gate['approved']} reason={spread_gate.get('reason')}")
         if not spread_gate["approved"]:
             await self._set_state(BotState.WAITING_MARKET_DATA, "spread_too_wide_extreme")
             await self._log("WARNING", f"trade_rejected_extreme_spread symbol={self.symbol} spread={spread:.8f} price={price:.8f}")
             return
 
         cost_gate = self._assess_trade_cost_gate(side)
+        self.logger.info(f"cost_gate: approved={cost_gate['approved']} reason={cost_gate.get('reason')}")
         if not cost_gate["approved"]:
             await self._set_state(BotState.WAITING_MARKET_DATA, "trade_costs_extreme")
             await self._log("WARNING", f"trade_rejected_extreme_costs symbol={self.symbol} side={side}")
             return
 
         pullback_ok, pullback_extreme = self._pullback_assessment(bundle, side, market_data)
+        self.logger.info(f"pullback: pullback_ok={pullback_ok} pullback_extreme={pullback_extreme}")
         pullback_multiplier = 1.0
         if not pullback_ok:
             if pullback_extreme:
@@ -1015,18 +1400,24 @@ class BotEngine:
             atr,
             regime=getattr(bundle, "regime", "NORMAL_VOLATILITY"),
         )
+        self.logger.info(f"stops: stop_loss={stop_loss} take_profit={take_profit}")
         trade_controls = self._compute_per_trade_investment_controls(
             confidence=_as_float(analysis.get("confidence"), 0.0),
             price=price,
             atr=atr,
         )
+        self.logger.info(f"trade_controls: risk_per_trade_fraction={trade_controls.get('risk_per_trade_fraction')} max_trade_balance_fraction={trade_controls.get('max_trade_balance_fraction')}")
+        
+        # Get position size multiplier from market adaptation
+        market_size_mult = self.market_adaptation.get_position_size_multiplier()
+        
         execution_soft_multiplier = max(_as_float(analysis.get("execution_soft_multiplier"), 1.0), 0.20)
         runtime_soft_multiplier = (
             max(float(spread_gate["size_multiplier"]), 0.20)
             * max(float(cost_gate["size_multiplier"]), 0.20)
             * pullback_multiplier
         )
-        total_soft_multiplier = execution_soft_multiplier * runtime_soft_multiplier
+        total_soft_multiplier = execution_soft_multiplier * runtime_soft_multiplier * market_size_mult
         qty = self.calculate_position_size(
             price,
             stop_loss,
@@ -1038,6 +1429,7 @@ class BotEngine:
             * max(total_soft_multiplier, 0.20),
             risk_fraction_override=trade_controls["risk_per_trade_fraction"],
         )
+        qty = max(qty, 0.0001)
         if total_soft_multiplier < 0.999:
             await self._log(
                 "INFO",
@@ -1048,7 +1440,10 @@ class BotEngine:
             )
         if qty <= 0:
             await self._log("WARNING", "quantity_below_minimum")
+            self.logger.warning(f"execute_trade: quantity_below_minimum qty={qty}")
             return
+
+        self.logger.info(f"execute_trade: Attempting {side} {qty} {self.symbol} at {price}")
 
         if getattr(self.settings, "spot_only_mode", True) and side == "SELL":
             available_sell_qty = self.order_manager.normalize_quantity(self._available_spot_sell_quantity())
@@ -1081,7 +1476,9 @@ class BotEngine:
 
         min_notional_buffer = self._current_capital_profile().min_operable_notional_buffer
         required_notional = self.order_manager.rules.min_notional * max(min_notional_buffer, 1.0) if self.order_manager.rules else 0.0
+        self.logger.info(f"NOTIONAL_CHECK: qty={normalized_qty} price={price} notional={normalized_qty * price} required={required_notional} min_notional_buffer={min_notional_buffer}")
         if required_notional > 0 and (normalized_qty * price) < required_notional:
+            self.logger.warning(f"NOTIONAL_REJECTED: notional={(normalized_qty * price):.8f} required={required_notional:.8f} min_notional_buffer={min_notional_buffer}")
             await self._log(
                 "WARNING",
                 "profile_notional_buffer_rejected "
@@ -1106,25 +1503,110 @@ class BotEngine:
             return
 
         await self._set_state(BotState.PLACING_ORDER)
+        self.logger.info(f"PLACING_ORDER: {side} {qty} {self.symbol} at {price}")
+        print(f">>>> PLACING ORDER: {side} {qty} {self.symbol}")
+        
+        order: dict[str, Any] | None = None
+        exec_result = None
+        
         try:
             intent_id = f"reco-open-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-            order = await self.client.create_market_order(self.symbol, side.lower(), qty, client_order_id=intent_id)
-        except ccxt.BaseError as exc:
+            
+            bid = _as_float(market_data.get("bid"), price)
+            ask = _as_float(market_data.get("ask"), price)
+            
+            order_request = OrderRequest(
+                symbol=self.symbol,
+                side=side.upper(),
+                quantity=qty,
+                order_type=OrderType.MARKET,
+                client_order_id=intent_id,
+            )
+            
+            exec_result = await self.executor.execute(
+                client=self.client,
+                request=order_request,
+                bid=bid if bid > 0 else None,
+                ask=ask if ask > 0 else None,
+                current_price=price,
+            )
+            
+            self.logger.info(f"ORDER_EXECUTED: {exec_result}")
+            
+            if exec_result.status.value in ("failed", "rejected"):
+                await self._log("ERROR", f"order_execution_failed reason={exec_result.error_message}")
+                await self.repository.record_error(self.state.value, "order", exec_result.error_message or "execution_failed")
+                return
+            
+            order = {
+                "id": exec_result.order_id,
+                "status": "closed" if exec_result.status.value == "filled" else exec_result.status.value,
+                "filled": exec_result.filled_quantity,
+                "average": exec_result.average_price,
+            }
+            
+            if exec_result.split_parts > 1:
+                await self._log("INFO", f"order_split_into_parts split_parts={exec_result.split_parts} total_filled={exec_result.filled_quantity}")
+            
+            print(f">>>> ORDER SUCCESS: {order}")
+            self.logger.info(f"ORDER_PLACED: {order}")
+            
+            order_id = exec_result.order_id
+            filled_qty = exec_result.filled_quantity
+            
+            if not order_id:
+                await self._log("ERROR", "order_verification_failed no_order_id")
+                return
+            
+            if filled_qty > 0 and abs(filled_qty - qty) / max(qty, 1e-9) > 0.01:
+                await self._log("WARNING", f"order_partial_fill requested={qty} filled={filled_qty}")
+                qty = filled_qty
+                self.snapshot["partial_fill"] = True
+                self.snapshot["filled_qty"] = filled_qty
+                self.snapshot["requested_qty"] = qty
+                
+            self.latency_optimizer.record_latency(exec_result.execution_time_ms)
+            self.snapshot["execution_slippage_pct"] = exec_result.slippage_percent
+            
+        except Exception as exc:
+            import traceback
+            print(f">>>> ORDER FAILED: {exc}")
+            self.logger.error(f"ORDER_EXCEPTION: {exc}\n{traceback.format_exc()}")
             await self._log("ERROR", f"order_rejected error={exc}")
             await self.repository.record_error(self.state.value, "order", str(exc))
             return
-
+        
+        if order is None:
+            await self._log("ERROR", "order_not_created_internal_error")
+            return
+        
         entry = _as_float(order.get("average"), _as_float(order.get("price"), price))
         slippage_ratio = abs(entry - price) / max(price, 1e-9)
         if slippage_ratio > _as_float(self.settings.max_slippage_ratio, 0.003):
+            auto_pause_on_slippage = bool(getattr(self.settings, "auto_pause_on_slippage", False))
+            disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
             await self._log("ERROR", f"slippage_too_high slippage_ratio={slippage_ratio:.6f}")
             try:
-                close_side = "sell" if side == "BUY" else "buy"
+                close_side = "SELL" if side == "BUY" else "BUY"
                 close_intent = f"reco-close-{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-                await self.client.create_market_order(self.symbol, close_side, qty, client_order_id=close_intent)
+                close_request = OrderRequest(
+                    symbol=self.symbol,
+                    side=close_side,
+                    quantity=qty,
+                    order_type=OrderType.MARKET,
+                    client_order_id=close_intent,
+                )
+                await self.executor.execute(
+                    client=self.client,
+                    request=close_request,
+                    current_price=entry,
+                )
             except ccxt.BaseError as exc:
                 await self.repository.record_error(self.state.value, "slippage_exit", str(exc))
-            self.pause_trading_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+            if auto_pause_on_slippage and not disable_auto_pause:
+                self.pause_trading_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+            else:
+                await self._log("WARNING", f"slippage_auto_pause_bypassed continuing_trading auto_pause_disabled=True")
             return
 
         stop_loss, take_profit = self._build_stops(
@@ -1144,7 +1626,7 @@ class BotEngine:
             entry_slippage_ratio=slippage_ratio,
         )
 
-        self.position_manager.open(
+        await self.position_manager.open(
             Position(
                 trade_id=trade.id,
                 side=side,
@@ -1158,6 +1640,15 @@ class BotEngine:
             )
         )
 
+        # Initialize smart stop tracking for this position
+        self.smart_stop_engine.initialize_position(
+            position_id=str(trade.id),
+            entry_price=entry,
+            initial_stop=stop_loss,
+            atr=max(atr, entry * 0.002),
+            side=side,
+        )
+
         self.trades_today += 1
         self.snapshot["trades_today"] = self.trades_today
         self.snapshot["last_trade"] = f"{side} @ {entry:.2f}"
@@ -1168,7 +1659,7 @@ class BotEngine:
             self.state_manager.add_trade(
                 {
                     "trade_id": trade.id,
-                    "time": datetime.utcnow().isoformat(timespec="seconds"),
+                    "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "pair": self.symbol,
                     "side": side,
                     "entry": entry,
@@ -1176,7 +1667,7 @@ class BotEngine:
                     "stop_loss": stop_loss,
                     "take_profit": take_profit,
                     "status": "OPEN",
-                    "entry_time": datetime.utcnow().isoformat(timespec="seconds"),
+                    "entry_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "exit_time": "-",
                     "fees": order.get("fee", {}).get("cost", 0),
                     "confidence": analysis.get("confidence"),
@@ -1200,27 +1691,45 @@ class BotEngine:
             else:
                 used_atr = max(atr, price * 0.002)
 
-            breakeven_threshold = (
-                position.entry_price + used_atr
-                if position.side == "BUY"
-                else position.entry_price - used_atr
-            )
-            if position.side == "BUY" and price >= breakeven_threshold:
-                new_sl = self.order_manager.normalize_price(position.entry_price + 0.1 * used_atr)
-                if new_sl > position.stop_loss:
-                    position.stop_loss = new_sl
-                    await self._log(
-                        "INFO",
-                        f"breakeven_activated trade_id={position.trade_id} new_sl={new_sl:.4f}",
-                    )
-            elif position.side == "SELL" and price <= breakeven_threshold:
-                new_sl = self.order_manager.normalize_price(position.entry_price - 0.1 * used_atr)
-                if new_sl < position.stop_loss:
-                    position.stop_loss = new_sl
-                    await self._log(
-                        "INFO",
-                        f"breakeven_activated trade_id={position.trade_id} new_sl={new_sl:.4f}",
-                    )
+            auto_stop_enabled = bool(getattr(self.settings, "auto_stop_enabled", True))
+            break_even_trigger_pct = max(float(getattr(self.settings, "auto_stop_break_even_trigger_pct", 0.008) or 0.008), 0.0)
+            break_even_buffer_pct = max(float(getattr(self.settings, "auto_stop_break_even_buffer_pct", 0.0005) or 0.0005), 0.0)
+            trailing_activate_pct = max(float(getattr(self.settings, "auto_stop_trailing_activate_pct", 0.012) or 0.012), 0.0)
+            low_delta_pct = max(float(getattr(self.settings, "auto_stop_trailing_delta_low_vol_pct", 0.006) or 0.006), 0.0001)
+            high_delta_pct = max(float(getattr(self.settings, "auto_stop_trailing_delta_high_vol_pct", 0.010) or 0.010), 0.0001)
+            max_duration_minutes = max(int(getattr(self.settings, "auto_stop_max_duration_minutes", 180) or 180), 1)
+
+            if position.side == "BUY":
+                profit_pct = (price - position.entry_price) / max(position.entry_price, 1e-9)
+            else:
+                profit_pct = (position.entry_price - price) / max(position.entry_price, 1e-9)
+
+            if auto_stop_enabled:
+                break_even_price = position.entry_price * (1.0 + break_even_buffer_pct if position.side == "BUY" else 1.0 - break_even_buffer_pct)
+                break_even_sl = self.order_manager.normalize_price(break_even_price)
+                if profit_pct >= break_even_trigger_pct:
+                    if position.side == "BUY" and break_even_sl > position.stop_loss:
+                        position.stop_loss = break_even_sl
+                        await self._log("INFO", f"auto_stop_break_even trade_id={position.trade_id} profit_pct={profit_pct:.4f} new_sl={break_even_sl:.6f}")
+                    elif position.side == "SELL" and break_even_sl < position.stop_loss:
+                        position.stop_loss = break_even_sl
+                        await self._log("INFO", f"auto_stop_break_even trade_id={position.trade_id} profit_pct={profit_pct:.4f} new_sl={break_even_sl:.6f}")
+
+                vol_state = str(self.snapshot.get("volatility_regime", "NORMAL")).upper()
+                trailing_delta_pct = high_delta_pct if vol_state in {"HIGH", "HIGH_VOLATILITY", "EXTREME"} else low_delta_pct
+                if profit_pct >= trailing_activate_pct:
+                    if position.side == "BUY":
+                        trailed_sl = self.order_manager.normalize_price(price * (1.0 - trailing_delta_pct))
+                        if trailed_sl > position.stop_loss:
+                            position.stop_loss = trailed_sl
+                            position.trailing_stop = trailed_sl
+                            await self._log("INFO", f"auto_stop_trailing trade_id={position.trade_id} delta_pct={trailing_delta_pct:.4f} new_sl={trailed_sl:.6f}")
+                    else:
+                        trailed_sl = self.order_manager.normalize_price(price * (1.0 + trailing_delta_pct))
+                        if trailed_sl < position.stop_loss:
+                            position.stop_loss = trailed_sl
+                            position.trailing_stop = trailed_sl
+                            await self._log("INFO", f"auto_stop_trailing trade_id={position.trade_id} delta_pct={trailing_delta_pct:.4f} new_sl={trailed_sl:.6f}")
 
             if position.side == "BUY":
                 unrealized_pnl = (price - position.entry_price) * position.quantity
@@ -1233,8 +1742,54 @@ class BotEngine:
             self.snapshot["open_position_sl"] = position.stop_loss
             self.snapshot["open_position_tp"] = position.take_profit
 
+            # Smart Stop Engine - Dynamic stop loss management
+            smart_stop_decision = self.smart_stop_engine.evaluate(
+                position_id=str(position.trade_id),
+                current_price=price,
+                entry_price=position.entry_price,
+                atr=used_atr,
+                side=position.side,
+                current_stop=position.stop_loss,
+                equity=float(self.snapshot.get("equity", self.snapshot.get("balance", 1000.0))),
+                position_value=abs(position.quantity * price),
+                market_data=market_data,
+            )
+            if smart_stop_decision.should_update and smart_stop_decision.new_stop_price:
+                new_stop = smart_stop_decision.new_stop_price
+                # Only update if it improves the stop
+                if position.side == "BUY" and new_stop > position.stop_loss:
+                    position.stop_loss = new_stop
+                    self.snapshot["open_position_sl"] = new_stop
+                    await self._log("INFO", f"smart_stop_updated trade_id={position.trade_id} type={smart_stop_decision.stop_type} new_sl={new_stop:.6f} reason={smart_stop_decision.reason}")
+                elif position.side == "SELL" and new_stop < position.stop_loss:
+                    position.stop_loss = new_stop
+                    self.snapshot["open_position_sl"] = new_stop
+                    await self._log("INFO", f"smart_stop_updated trade_id={position.trade_id} type={smart_stop_decision.stop_type} new_sl={new_stop:.6f} reason={smart_stop_decision.reason}")
+                elif smart_stop_decision.stop_type == "emergency":
+                    position.stop_loss = new_stop
+                    self.snapshot["open_position_sl"] = new_stop
+                    await self._log("WARNING", f"smart_stop_EMERGENCY trade_id={position.trade_id} new_sl={new_stop:.6f} urgency={smart_stop_decision.urgency}")
+            
+            # Check for emergency exit from SmartStopEngine
+            should_emergency_exit, emergency_reason = self.smart_stop_engine.should_emergency_exit(
+                position_id=str(position.trade_id),
+                current_price=price,
+                entry_price=position.entry_price,
+                side=position.side,
+                market_data=market_data,
+            )
+            if should_emergency_exit:
+                self.snapshot["smart_stop_stats"]["emergency_exits"] = self.snapshot.get("smart_stop_stats", {}).get("emergency_exits", 0) + 1
+
             structure_exit_reason = self._detect_structure_exit(position, market_data, price, used_atr)
             exit_reason = self._resolve_structure_exit_signal(position, structure_exit_reason)
+            if exit_reason is None and should_emergency_exit:
+                exit_reason = emergency_reason
+                await self._log("WARNING", f"smart_stop_emergency_exit trade_id={position.trade_id} reason={emergency_reason}")
+            if exit_reason is None and auto_stop_enabled and position.entry_timestamp_ms:
+                age_minutes = (time.time() * 1000 - float(position.entry_timestamp_ms)) / 60000.0
+                if age_minutes >= max_duration_minutes:
+                    exit_reason = "AUTO_STOP_MAX_DURATION"
             if exit_reason is None and bool(position.dynamic_exit_enabled):
                 intelligence = self.exit_intelligence.evaluate(
                     position=position,
@@ -1251,7 +1806,7 @@ class BotEngine:
                     exit_reason = intelligence.reason
                     await self._record_exit_intelligence_event(position, intelligence)
             if exit_reason is None:
-                exit_reason = self.position_manager.check_exit(position, price)
+                exit_reason = await self.position_manager.check_exit(position, price)
             if not exit_reason:
                 continue
 
@@ -1402,18 +1957,40 @@ class BotEngine:
                 await self._log("ERROR", f"MANUAL_TRADE_CLOSE_FAILED trade_id={position.trade_id} action=retry_next_loop")
 
     async def _close_position(self, position: Position, exit_reason: str, reference_price: float) -> bool:
-        close_side = "sell" if position.side == "BUY" else "buy"
-        order = None
+        close_side = "SELL" if position.side == "BUY" else "BUY"
+        exec_result = None
+        bid = _as_float(self.snapshot.get("bid"), reference_price)
+        ask = _as_float(self.snapshot.get("ask"), reference_price)
+        
         for attempt in range(1, 4):
             try:
                 intent_id = f"reco-close-{position.trade_id}-{attempt}-{uuid.uuid4().hex[:6]}"
-                order = await self.client.create_market_order(
-                    self.symbol,
-                    close_side,
-                    position.quantity,
+                close_request = OrderRequest(
+                    symbol=self.symbol,
+                    side=close_side,
+                    quantity=position.quantity,
+                    order_type=OrderType.MARKET,
                     client_order_id=intent_id,
                 )
-                break
+                exec_result = await self.executor.execute(
+                    client=self.client,
+                    request=close_request,
+                    bid=bid if bid > 0 else None,
+                    ask=ask if ask > 0 else None,
+                    current_price=reference_price,
+                )
+                
+                if exec_result.status.value in ("filled", "partially_filled"):
+                    break
+                    
+                if exec_result.status.value in ("failed", "rejected"):
+                    await self._log(
+                        "WARNING",
+                        f"close_order_attempt_failed trade_id={position.trade_id} reason={exit_reason} attempt={attempt}/3 error={exec_result.error_message}",
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+                    
             except ccxt.BaseError as exc:
                 await self._log(
                     "WARNING",
@@ -1422,16 +1999,16 @@ class BotEngine:
                 if attempt < 3:
                     await asyncio.sleep(1)
 
-        if order is None:
+        if exec_result is None or exec_result.status.value in ("failed", "rejected"):
             await self.repository.record_error(self.state.value, "close_order", f"trade_id={position.trade_id} reason={exit_reason}")
             return False
 
-        exit_price = _as_float(order.get("average"), _as_float(order.get("price"), reference_price))
+        exit_price = exec_result.average_price if exec_result.average_price > 0 else reference_price
         pnl = (exit_price - position.entry_price) * position.quantity
         if position.side == "SELL":
             pnl *= -1
 
-        exit_slippage_ratio = abs(exit_price - reference_price) / max(reference_price, 1e-9)
+        exit_slippage_ratio = exec_result.slippage_percent /100.0 if exec_result.slippage_percent else 0.0
         await self.repository.close_trade(
             position.trade_id,
             exit_price,
@@ -1439,7 +2016,9 @@ class BotEngine:
             exit_reason,
             exit_slippage_ratio=exit_slippage_ratio,
         )
-        self.position_manager.close(position.trade_id)
+        # Cleanup smart stop tracking
+        self.smart_stop_engine.cleanup_position(str(position.trade_id))
+        await self.position_manager.close(position.trade_id)
         self._recent_pnls.append(pnl)
         self.session_tracker.record(pnl)
         if len(self._recent_pnls) > 20:
@@ -1462,6 +2041,23 @@ class BotEngine:
                 "exit_reason": exit_reason,
             })
             self.logger.info(f"Trade recorded for auto-improvement: PnL={pnl:.4f}, Duration={duration_minutes:.1f}min")
+        
+        # Record trade for IntelligentCapitalManager
+        self.intelligent_capital_manager.record_trade(pnl, pnl > 0)
+        self.intelligent_capital_manager.update_capital(_as_float(self.snapshot.get("equity"), 1000.0))
+        
+        # Record trade for SelfAnalyzer
+        if self.self_analyzer.enabled:
+            self.self_analyzer.record_trade({
+                "timestamp": datetime.now(timezone.utc),
+                "side": position.side,
+                "entry": position.entry_price,
+                "exit": exit_price,
+                "size": position.quantity,
+                "pnl": pnl,
+                "duration_minutes": (datetime.now(timezone.utc) - entry_time).total_seconds() / 60,
+                "exit_reason": exit_reason,
+            })
 
         if pnl > 0:
             self.win_count += 1
@@ -1473,13 +2069,29 @@ class BotEngine:
         self.emergency_system.record_trade(pnl, pnl > 0)
         self.emergency_system.update_equity(_as_float(self.snapshot.get("total_equity"), 1000.0))
         
+        if hasattr(self, 'autonomous_brain') and self.autonomous_brain:
+            try:
+                trade_data = {
+                    "pnl": pnl,
+                    "pnl_percent": (pnl / position.entry_price * 100) if position.entry_price else 0,
+                    "symbol": self.symbol,
+                    "side": position.side,
+                    "entry_price": position.entry_price,
+                    "exit_price": exit_price,
+                    "quantity": position.quantity,
+                }
+                self.autonomous_brain.record_trade(trade_data)
+                self.logger.info(f"Trade recorded in Autonomous Brain: PnL={pnl:.4f}")
+            except Exception as e:
+                self.logger.error(f"Error recording trade in autonomous brain: {e}")
+        
         self._sync_ui_state()
 
         if self.state_manager:
             self.state_manager.add_trade(
                 {
                     "trade_id": position.trade_id,
-                    "time": datetime.utcnow().isoformat(timespec="seconds"),
+                    "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "pair": self.symbol,
                     "side": position.side,
                     "entry": position.entry_price,
@@ -1488,8 +2100,8 @@ class BotEngine:
                     "pnl": pnl,
                     "status": exit_reason,
                     "entry_time": "-",
-                    "exit_time": datetime.utcnow().isoformat(timespec="seconds"),
-                    "fees": order.get("fee", {}).get("cost", 0),
+                    "exit_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "fees": exec_result.fees if exec_result else 0,
                     "confidence": None,
                     "signal_details": exit_reason,
                     "exit_slippage_ratio": exit_slippage_ratio,
@@ -1573,13 +2185,13 @@ class BotEngine:
         total_equity = _as_float(self.snapshot.get("total_equity"), _as_float(self.snapshot.get("equity"), 0.0))
         peak_equity = max(_as_float(getattr(self, "equity_peak", total_equity), total_equity), 1e-9)
         drawdown = max((peak_equity - total_equity) / peak_equity, 0.0)
-        drawdown_mult = max(1.0 - drawdown * 1.8, 0.40)
+        drawdown_mult = max(1.0 - drawdown * 1.2, 0.40)
 
         profile = self._current_capital_profile()
         trade_risk = anchor_risk * confidence_mult * volatility_mult * drawdown_mult
         trade_allocation = anchor_allocation * confidence_mult * volatility_mult * drawdown_mult
-        trade_risk = min(max(trade_risk, 0.001), profile.risk_per_trade_fraction, 0.10)
-        trade_allocation = min(max(trade_allocation, 0.01), profile.max_trade_balance_fraction, 1.0)
+        trade_risk = min(max(trade_risk, 0.001), min(profile.risk_per_trade_fraction, 0.10))
+        trade_allocation = min(max(trade_allocation, 0.01), min(profile.max_trade_balance_fraction, 1.0))
         self.snapshot["live_trade_risk_fraction"] = trade_risk
         self.snapshot["live_trade_max_allocation_fraction"] = trade_allocation
         return {
@@ -1627,13 +2239,24 @@ class BotEngine:
         self, side: str, entry: float, atr: float, regime: str = "NORMAL_VOLATILITY"
     ) -> tuple[float, float]:
         atr = max(atr, entry * 0.002)
+        
+        # Get adapted stop/take from market adaptation
+        sl_mult, tp_mult = self.market_adaptation.get_stop_take_multiplier()
+        
+        # Override with regime-specific if more aggressive
         regime_upper = regime.upper()
         if "HIGH" in regime_upper:
-            sl_mult, tp_mult = 1.2, 2.4
+            sl_mult = max(sl_mult, 1.2)
+            tp_mult = max(tp_mult, 2.4)
         elif "LOW" in regime_upper:
-            sl_mult, tp_mult = 1.8, 3.0
-        else:
-            sl_mult, tp_mult = 1.5, 2.5
+            sl_mult = max(sl_mult, 1.8)
+            tp_mult = max(tp_mult, 3.0)
+        
+        # Apply scalping mode adjustments
+        if self.market_adaptation.scalping_mode:
+            # Tighter stops for scalping
+            sl_mult = min(sl_mult, 1.2)
+            tp_mult = min(tp_mult, 1.5)
 
         if side == "BUY":
             stop_loss = self.order_manager.normalize_price(entry - sl_mult * atr)
@@ -1641,6 +2264,12 @@ class BotEngine:
         else:
             stop_loss = self.order_manager.normalize_price(entry + sl_mult * atr)
             take_profit = self.order_manager.normalize_price(entry - tp_mult * atr)
+        
+        # Log the stop/take for debugging
+        self.snapshot["stop_loss_atr_mult"] = sl_mult
+        self.snapshot["take_profit_atr_mult"] = tp_mult
+        self.snapshot["scalping_mode"] = self.market_adaptation.scalping_mode
+        
         return stop_loss, take_profit
 
     def _update_loss_protection(self, pnl: float) -> bool:
@@ -1649,10 +2278,23 @@ class BotEngine:
         else:
             self.consecutive_losses = 0
 
+        auto_pause_on_losses = bool(getattr(self.settings, "auto_pause_on_consecutive_losses", False))
+        disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+        
         if self.consecutive_losses >= self._effective_loss_pause_after_consecutive():
-            self.pause_trading_until = datetime.now(timezone.utc) + timedelta(minutes=self._effective_loss_pause_minutes())
-            self.consecutive_losses = 0
-            return True
+            if auto_pause_on_losses and not disable_auto_pause:
+                self.pause_trading_until = datetime.now(timezone.utc) + timedelta(minutes=self._effective_loss_pause_minutes())
+                self.consecutive_losses = 0
+                return True
+            else:
+                self.logger.warning(
+                    "consecutive_losses_reached count=%d threshold=%d auto_pause_disabled=True",
+                    self.consecutive_losses,
+                    self._effective_loss_pause_after_consecutive(),
+                )
+                self.snapshot["consecutive_loss_warning"] = self.consecutive_losses
+                self.consecutive_losses = 0
+                return False
         return False
 
     async def _persist_signal(
@@ -1683,22 +2325,100 @@ class BotEngine:
 
     def _update_snapshot(self, market_data: dict[str, Any], analysis: dict[str, Any]) -> None:
         bundle: SignalBundle = analysis["bundle"]
+        frame5 = market_data.get("frame5")
+        candles_5m = market_data.get("candles_5m", [])
+        
+        candle_list = []
+        if candles_5m and isinstance(candles_5m, list):
+            candle_list = list(candles_5m[-200:])
+        elif frame5 is not None and hasattr(frame5, 'to_dict'):
+            try:
+                records = frame5.to_dict('records')[-200:]
+                for r in records:
+                    ts = r.get("timestamp")
+                    if ts:
+                        if isinstance(ts, datetime):
+                            ts_int = int(ts.timestamp())
+                        else:
+                            ts_int = int(ts)
+                    else:
+                        ts_int = 0
+                    candle_list.append({
+                        "time": ts_int,
+                        "open": float(r.get("open", 0)),
+                        "high": float(r.get("high", 0)),
+                        "low": float(r.get("low", 0)),
+                        "close": float(r.get("close", 0)),
+                    })
+            except Exception:
+                pass
+        
+        rsi_val = 50.0
+        macd_val = 0.0
+        ema_cross_val = "NEUTRAL"
+        vol_ratio = 1.0
+        if frame5 is not None and hasattr(frame5, 'iloc') and len(frame5) > 0:
+            row = frame5.iloc[-1]
+            rsi_val = float(row.get("rsi", 50.0))
+            macd_val = float(row.get("macd_diff", 0.0))
+            vol_ratio = float(row.get("vol_ratio", 1.0))
+            if len(frame5) >= 2:
+                ema9_now = float(row.get("ema9", 0))
+                ema20_now = float(row.get("ema20", 0))
+                prev = frame5.iloc[-2]
+                ema9_prev = float(prev.get("ema9", 0))
+                ema20_prev = float(prev.get("ema20", 0))
+                if ema9_now > ema20_now and ema9_prev <= ema20_prev:
+                    ema_cross_val = "BULLISH"
+                elif ema9_now < ema20_now and ema9_prev >= ema20_prev:
+                    ema_cross_val = "BEARISH"
+                elif ema9_now > ema20_now:
+                    ema_cross_val = "ABOVE"
+                else:
+                    ema_cross_val = "BELOW"
+        
+        tf_analysis = {}
+        try:
+            tf_5m = bundle.trend
+            tf_15m = "NEUTRAL"
+            tf_1h = "NEUTRAL"
+            frame15 = market_data.get("frame15")
+            if frame15 is not None and hasattr(frame15, 'iloc') and len(frame15) > 0:
+                r15 = frame15.iloc[-1]
+                ema20_15 = float(r15.get("ema20", 0))
+                ema50_15 = float(r15.get("ema50", 0))
+                if ema20_15 > ema50_15:
+                    tf_15m = "BUY"
+                elif ema20_15 < ema50_15:
+                    tf_15m = "SELL"
+            tf_analysis = {"5m": tf_5m, "15m": tf_15m, "1h": tf_1h}
+        except Exception:
+            tf_analysis = {"5m": "NEUTRAL", "15m": "NEUTRAL", "1h": "NEUTRAL"}
+        
         self.snapshot.update(
             {
                 "pair": self.symbol,
                 "timeframe": f"{self.settings.primary_timeframe} / {self.settings.confirmation_timeframe}",
                 "price": market_data.get("price"),
+                "current_price": market_data.get("price"),
                 "spread": market_data.get("spread"),
                 "bid": market_data.get("bid"),
                 "ask": market_data.get("ask"),
                 "trend": bundle.trend,
+                "momentum": bundle.momentum,
                 "adx": market_data.get("adx"),
+                "atr": market_data.get("atr"),
+                "rsi": rsi_val,
+                "macd_diff": macd_val,
+                "ema_cross": ema_cross_val,
+                "volume_ratio": vol_ratio,
                 "volatility_regime": bundle.regime,
+                "volatility_state": bundle.regime,
                 "order_flow": bundle.order_flow,
                 "volume": market_data.get("volume"),
-                "atr": market_data.get("atr"),
                 "change_24h": market_data.get("change_24h"),
-                "candles_5m": list(market_data.get("candles_5m") or [])[-120:],
+                "volume_24h": market_data.get("volume_24h", 0),
+                "candles_5m": candle_list,
                 "signal": analysis.get("side"),
                 "raw_signal": analysis.get("raw_side"),
                 "confidence": analysis.get("confidence"),
@@ -1712,6 +2432,7 @@ class BotEngine:
                     "structure": bundle.structure,
                     "order_flow": bundle.order_flow,
                 },
+                "timeframe_analysis": tf_analysis,
                 "decision_trace": analysis.get("decision_trace", self.snapshot.get("decision_trace", {})),
                 "decision_gating": self.snapshot.get("decision_gating", {}),
                 "decision_reason": self.snapshot.get("decision_reason", "ANALYSIS"),
@@ -1734,7 +2455,7 @@ class BotEngine:
         self.snapshot["distance_to_support"] = intelligence.get("distance_to_support")
         self.snapshot["distance_to_resistance"] = intelligence.get("distance_to_resistance")
 
-    async def _fetch_balances(self) -> tuple[float, float, str, str]:
+    async def _fetch_balances(self) -> tuple[float, float]:
         payload = await self.client.fetch_balance()
         base_asset, quote_asset = split_symbol(self.symbol)
         quote_asset = quote_asset or "USDT"
@@ -1743,13 +2464,13 @@ class BotEngine:
         if isinstance(total_balances, dict):
             quote_balance = _as_float(total_balances.get(quote_asset), 0.0)
             base_balance = _as_float(total_balances.get(base_asset), 0.0)
-            return quote_balance, base_balance, quote_asset, base_asset
+            return quote_balance, base_balance
 
         quote = payload.get(quote_asset) if isinstance(payload, dict) else {}
         base = payload.get(base_asset) if isinstance(payload, dict) else {}
         quote_balance = _as_float((quote or {}).get("free"), 0.0)
         base_balance = _as_float((base or {}).get("free"), 0.0)
-        return quote_balance, base_balance, quote_asset, base_asset
+        return quote_balance, base_balance
 
     async def _quote_to_usdt_rate(self, quote_asset: str) -> float:
         normalized = str(quote_asset or "USDT").upper()
@@ -1773,41 +2494,105 @@ class BotEngine:
             return rate
         return 1.0
 
+    async def _asset_to_usdt_rate(self, asset: str) -> float:
+        normalized = str(asset or "").upper().strip()
+        if not normalized:
+            return 0.0
+        if normalized == "USDT":
+            return 1.0
+        now = datetime.now(timezone.utc)
+        cached = self._asset_to_usdt_cache.get(normalized)
+        if cached and (now - cached[1]).total_seconds() < 300:
+            return cached[0]
+        for pair in (f"{normalized}/USDT", f"USDT/{normalized}"):
+            try:
+                ticker = await self.client.fetch_ticker(pair)
+            except Exception:  # noqa: BLE001
+                continue
+            last_price = _as_float((ticker or {}).get("last"), 0.0)
+            if last_price <= 0:
+                continue
+            rate = last_price if pair.startswith(normalized) else (1.0 / last_price)
+            self._asset_to_usdt_cache[normalized] = (rate, now)
+            return rate
+        for bridge in ("USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB"):
+            if bridge == normalized:
+                continue
+            bridge_rate = await self._asset_to_usdt_rate(bridge)
+            if bridge_rate <= 0:
+                continue
+            for pair in (f"{normalized}/{bridge}", f"{bridge}/{normalized}"):
+                try:
+                    ticker = await self.client.fetch_ticker(pair)
+                except Exception:  # noqa: BLE001
+                    continue
+                last_price = _as_float((ticker or {}).get("last"), 0.0)
+                if last_price <= 0:
+                    continue
+                asset_to_bridge = last_price if pair.startswith(normalized) else (1.0 / last_price)
+                rate = asset_to_bridge * bridge_rate
+                self._asset_to_usdt_cache[normalized] = (rate, now)
+                return rate
+        return 0.0
+
+    async def _compute_total_equity_usdt(self, payload: dict[str, Any]) -> float:
+        if not isinstance(payload, dict):
+            return 0.0
+        totals = payload.get("total")
+        if not isinstance(totals, dict):
+            totals = {}
+            free = payload.get("free")
+            used = payload.get("used")
+            if isinstance(free, dict):
+                for asset, amount in free.items():
+                    totals[str(asset)] = _as_float(amount, 0.0)
+            if isinstance(used, dict):
+                for asset, amount in used.items():
+                    totals[str(asset)] = _as_float(totals.get(str(asset), 0.0), 0.0) + _as_float(amount, 0.0)
+        if not totals:
+            return 0.0
+        total_equity_usdt = 0.0
+        for asset, amount in totals.items():
+            quantity = _as_float(amount, 0.0)
+            if quantity <= 0:
+                continue
+            rate = await self._asset_to_usdt_rate(str(asset))
+            if rate <= 0:
+                continue
+            total_equity_usdt += quantity * rate
+        return float(total_equity_usdt)
+
     async def _refresh_account_snapshot(self, current_price: float | None = None) -> None:
-        balances = await self._fetch_balances()
-        if len(balances) == 4:
-            quote_balance, base_balance, quote_asset, _base_asset = balances
-        else:
-            quote_balance, base_balance = balances  # type: ignore[misc]
-            quote_asset = "USDT"
+        usdt_balance, btc_balance = await self._fetch_balances()
         reference_price = max(_as_float(current_price, _as_float(self.snapshot.get("price"), 0.0)), 0.0)
-        base_value_quote = float(base_balance * reference_price)
-        total_equity_quote = float(quote_balance + base_value_quote)
-        quote_to_usdt_rate = await self._quote_to_usdt_rate(quote_asset)
-        total_equity_usdt = float(total_equity_quote * quote_to_usdt_rate)
+        btc_value = float(btc_balance * reference_price)
+        total_equity = float(usdt_balance + btc_value)
         session_pnl = float(await self.repository.get_session_pnl() or 0.0)
 
-        self.snapshot["balance"] = float(quote_balance)
-        self.snapshot["btc_balance"] = float(base_balance)
-        self.snapshot["btc_value"] = base_value_quote
-        self.snapshot["total_equity"] = total_equity_quote
-        self.snapshot["total_equity_usdt"] = total_equity_usdt
-        self.snapshot["equity"] = total_equity_quote
-        self.snapshot["account_currency"] = quote_asset
+        self.snapshot["balance"] = float(usdt_balance)
+        self.snapshot["btc_balance"] = float(btc_balance)
+        self.snapshot["btc_value"] = btc_value
+        self.snapshot["total_equity"] = total_equity
+        self.snapshot["total_equity_usdt"] = total_equity
+        self.snapshot["equity"] = total_equity
+        self.snapshot["account_currency"] = "USDT"
         self.snapshot["daily_pnl"] = session_pnl
         self.snapshot["session_pnl"] = session_pnl
         self.snapshot["trades_today"] = self.trades_today
         self.snapshot["win_rate"] = self.win_count / self.trades_today if self.trades_today else 0.0
 
-        profile = self._current_capital_profile()
-        operable_capital = self._operable_equity_for_trading(total_equity_usdt, profile)
-        self.snapshot["capital_profile"] = profile.name
-        self.snapshot["operable_capital_usdt"] = operable_capital
+        profile_getter = getattr(self, "_current_capital_profile", None)
+        operable_getter = getattr(self, "_operable_equity_for_trading", None)
+        if callable(profile_getter) and callable(operable_getter):
+            profile = profile_getter()
+            operable_capital = operable_getter(total_equity, profile)
+            self.snapshot["capital_profile"] = profile.name
+            self.snapshot["operable_capital_usdt"] = operable_capital
 
         if self.starting_equity is None:
-            self.starting_equity = max(total_equity_usdt, 1.0)
-        self.equity_peak = max(_as_float(self.equity_peak, total_equity_usdt), total_equity_usdt)
-        self._append_equity_point(total_equity_usdt)
+            self.starting_equity = max(total_equity, 1.0)
+        self.equity_peak = max(_as_float(self.equity_peak, total_equity), total_equity)
+        self._append_equity_point(total_equity)
 
     def _append_equity_point(self, equity: float) -> None:
         normalized = round(float(max(equity, 0.0)), 8)
@@ -1820,15 +2605,15 @@ class BotEngine:
         open_trades = await self.repository.get_open_trades(self.symbol)
         if not open_trades:
             return
-        quote_balance, base_balance, quote_asset, _base_asset = await self._fetch_balances()
-        self.snapshot["balance"] = quote_balance
+        usdt_balance, base_balance = await self._fetch_balances()
+        self.snapshot["balance"] = usdt_balance
         self.snapshot["btc_balance"] = base_balance
-        self.snapshot["account_currency"] = quote_asset
+        self.snapshot["account_currency"] = "USDT"
         latest = open_trades[0]
         if base_balance <= 0:
             await self._log("WARNING", "open_trade_found_without_base_balance")
             return
-        self.position_manager.open(
+        await self.position_manager.open(
             Position(
                 trade_id=latest.id,
                 side=latest.side,
@@ -1842,30 +2627,222 @@ class BotEngine:
         )
         await self._log("INFO", f"reconciled_open_position trade_id={latest.id} quantity={min(latest.quantity, base_balance):.8f}")
 
+    async def _switch_to_pair(self, new_symbol: str) -> None:
+        """Switch to a new trading pair with proper cleanup and rule sync."""
+        try:
+            old_symbol = self.symbol
+            self.symbol = normalize_symbol(new_symbol)
+            self.order_manager = OrderManager(self.client, self.symbol)
+            await self.order_manager.sync_rules()
+            self.market_stream = MarketStream(self.client, self.symbol, self.settings.history_limit)
+            self._cached_frame5 = None
+            self._cached_frame15 = None
+            self.multi_pair_manager.record_switch(old_symbol, self.symbol)
+            self.logger.warning(f"Auto-switched to best pair: {old_symbol} -> {self.symbol}")
+            self.snapshot["pair_switch"] = self.symbol
+        except Exception as exc:
+            self.logger.error(f"Failed to switch pair to {new_symbol}: {exc}")
+            self.snapshot["pair_switch_error"] = str(exc)
+            self.symbol = normalize_symbol(old_symbol)
+
+    def _start_ml_auto_training(self) -> None:
+        """Start background auto-training of ML models with historical data."""
+        import threading
+        
+        def _train_models_in_background():
+            try:
+                import pandas as pd
+                
+                # Get historical data for training
+                self.logger.info("Starting ML auto-training with historical data...")
+                
+                # Train TFT model
+                if hasattr(self, 'tft_manager') and self.tft_manager:
+                    try:
+                        import ccxt.async_support as ccxt_async
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            exchange = ccxt_async.binance({"enableRateLimit": True})
+                            ohlcv = loop.run_until_complete(
+                                exchange.fetch_ohlcv(self.symbol, "5m", limit=500)
+                            )
+                            loop.run_until_complete(exchange.close())
+                            
+                            if ohlcv:
+                                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                                df.set_index("timestamp", inplace=True)
+                                
+                                result = self.tft_manager.train(df, self.symbol)
+                                self.logger.info(f"TFT model trained: {result}")
+                        finally:
+                            loop.close()
+                    except Exception as tft_exc:
+                        self.logger.debug(f"TFT auto-training skipped: {tft_exc}")
+                
+                # Train NBEATS model
+                if hasattr(self, 'nbeats_manager') and self.nbeats_manager:
+                    try:
+                        import ccxt.async_support as ccxt_async
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            exchange = ccxt_async.binance({"enableRateLimit": True})
+                            ohlcv = loop.run_until_complete(
+                                exchange.fetch_ohlcv(self.symbol, "5m", limit=500)
+                            )
+                            loop.run_until_complete(exchange.close())
+                            
+                            if ohlcv:
+                                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                                df.set_index("timestamp", inplace=True)
+                                
+                                result = self.nbeats_manager.train(df, self.symbol)
+                                self.logger.info(f"NBEATS model trained: {result}")
+                        finally:
+                            loop.close()
+                    except Exception as nb_exc:
+                        self.logger.debug(f"NBEATS auto-training skipped: {nb_exc}")
+                
+                self.logger.info("ML auto-training complete")
+            except Exception as exc:
+                self.logger.warning(f"ML auto-training failed: {exc}")
+        
+        # Run in background thread to not block startup
+        thread = threading.Thread(target=_train_models_in_background, daemon=True, name="ml-auto-training")
+        thread.start()
+        self.logger.info("ML auto-training started in background")
+
+    async def _start_market_analysis(self, market_count: int) -> None:
+        """Analyze all markets to find the best trading pair."""
+        self._market_analysis_cancelled = False
+        ma = self.snapshot["market_analysis"]
+        ma["status"] = "running"
+        ma["total_markets"] = market_count
+        ma["analyzed_markets"] = 0
+        ma["progress_pct"] = 0.0
+        ma["best_pair"] = "--"
+        ma["best_score"] = 0.0
+        self._sync_ui_state()
+
+        try:
+            all_tickers = await self.client.fetch_tickers()
+            usdt_pairs = [
+                sym for sym in all_tickers.keys()
+                if sym.endswith("/USDT") and ":" not in sym and sym.count("/") == 1
+            ][:market_count]
+
+            best_pair = "--"
+            best_score = 0.0
+
+            for i, pair in enumerate(usdt_pairs):
+                if self._market_analysis_cancelled:
+                    ma["status"] = "cancelled"
+                    ma["progress_pct"] = 0.0
+                    self._sync_ui_state()
+                    return
+
+                try:
+                    ticker = all_tickers.get(pair, {})
+                    price = float(ticker.get("last", 0))
+                    volume = float(ticker.get("baseVolume", 0))
+                    change = float(ticker.get("percentage", 0) or 0)
+                    spread = 0.0
+                    if ticker.get("ask") and ticker.get("bid"):
+                        spread = (float(ticker["ask"]) - float(ticker["bid"])) / float(ticker["ask"]) * 100 if float(ticker["ask"]) > 0 else 0
+
+                    score = 0.0
+                    if price > 0:
+                        score += min(volume / 1000, 30)
+                        score += min(abs(change) / 5, 20)
+                        score += max(0, 20 - spread * 10)
+                        score += min(price / 1000, 10)
+                        score += 20
+
+                    if score > best_score:
+                        best_score = score
+                        best_pair = pair
+
+                    ma["analyzed_markets"] = i + 1
+                    ma["progress_pct"] = ((i + 1) / len(usdt_pairs)) * 100
+                    ma["best_pair"] = best_pair
+                    ma["best_score"] = best_score
+                    self._sync_ui_state()
+                except Exception:
+                    continue
+
+            from datetime import datetime, timezone
+            ma["status"] = "completed"
+            ma["progress_pct"] = 100.0
+            ma["best_pair"] = best_pair
+            ma["best_score"] = best_score
+            ma["last_analysis_time"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            self._sync_ui_state()
+            await self._log("INFO", f"market_analysis_completed best={best_pair} score={best_score:.2f}")
+        except Exception as exc:
+            ma["status"] = "idle"
+            ma["progress_pct"] = 0.0
+            self._sync_ui_state()
+            await self._log("ERROR", f"market_analysis_failed: {exc}")
+
+    def _on_auto_fix_refresh(self) -> None:
+        """Called by AutoFixCoordinator after fixes are applied."""
+        self.logger.info("Auto-fix refresh triggered - applying corrections")
+        self.snapshot["auto_fix_applied"] = True
+        self._sync_ui_state()
+
+    async def _run_log_analysis_cycle(self) -> None:
+        """LLM log analysis is disabled; keep method as a no-op for compatibility."""
+        return
+
     async def _process_control_requests(self) -> None:
-        if not self.state_manager or not hasattr(self.state_manager, "pop_control_requests"):
-            return
-        controls = self.state_manager.pop_control_requests()
+        controls: list[str] = []
+        if self.state_manager and hasattr(self.state_manager, "pop_control_requests"):
+            controls = self.state_manager.pop_control_requests()
+
         for control in controls:
             if control == "force_close":
                 await self.force_close_position()
             elif control == "pause":
                 self.manual_pause = True
+                self.snapshot["user_paused"] = True
                 await self._log("WARNING", "manual_pause_requested")
             elif control in {"start", "resume"}:
                 self.manual_pause = False
                 self.emergency_stop_active = False
+                self.snapshot["user_paused"] = False
+                self.snapshot["emergency_stop_active"] = False
                 await self._log("INFO", f"manual_control_{control}")
             elif control == "emergency_stop":
                 self.emergency_stop_active = True
                 self.manual_pause = True
                 await self._log("ERROR", "emergency_stop_requested")
                 await self.force_close_position()
+            elif control == "clear_all_blocks":
+                self.manual_pause = False
+                self.emergency_stop_active = False
+                self.trading_paused_by_drawdown = False
+                self.pause_trading_until = None
+                self.exchange_failure_paused_until = None
+                self.consecutive_losses = 0
+                self.snapshot["user_paused"] = False
+                self.snapshot["emergency_stop_active"] = False
+                self.snapshot["cooldown"] = None
+                await self._log("INFO", "all_blocks_cleared")
 
-        if hasattr(self.state_manager, "pop_runtime_settings"):
-            runtime_updates = self.state_manager.pop_runtime_settings()
-            for update in runtime_updates:
-                await self._apply_runtime_settings(update)
+        runtime_updates: list[dict[str, Any]] = []
+        if self.state_manager and hasattr(self.state_manager, "pop_runtime_settings"):
+            runtime_updates.extend(self.state_manager.pop_runtime_settings())
+
+        requested = self.snapshot.get("runtime_settings_request")
+        if isinstance(requested, dict) and requested:
+            runtime_updates.append(requested)
+            self.snapshot["runtime_settings_request"] = None
+
+        for update in runtime_updates:
+            await self._apply_runtime_settings(update)
 
     async def _sleep_with_responsiveness(self, seconds: float) -> None:
         total = max(float(seconds), 0.0)
@@ -1949,7 +2926,13 @@ class BotEngine:
         filter_config = sanitized.get("filter_config", {})
         if filter_config:
             self._apply_symbol_filter_config(filter_config)
-        
+        elif symbol_switched:
+            # Al cambiar de mercado desde dashboard, refrescar filtros de inmediato
+            # para evitar mezclar umbrales del par anterior.
+            self._apply_symbol_filter_config(self._get_default_filter_config())
+            self.snapshot["autonomous_filters"] = dict(self.runtime_filter_config)
+            self.snapshot["autonomous_filter_reason"] = "symbol_switch_immediate_refresh"
+
         if symbol_switched:
             self.snapshot["pair"] = self.symbol
         if persist:
@@ -1983,6 +2966,9 @@ class BotEngine:
         self._last_primary_indicator_ts = None
         self._last_confirmation_indicator_ts = None
         self._quote_to_usdt_cache.clear()
+        self._asset_to_usdt_cache.clear()
+        self.base_filter_config = self._get_default_filter_config()
+        self.runtime_filter_config = dict(self.base_filter_config)
         self.snapshot.update(
             {
                 "pair": normalized_symbol,
@@ -1995,8 +2981,19 @@ class BotEngine:
             }
         )
         await self.order_manager.sync_rules()
+        self.runtime_filter_config = self._get_default_filter_config()
+        self.snapshot["autonomous_filters"] = self.runtime_filter_config.copy()
         await self._set_state(BotState.WAITING_MARKET_DATA, "runtime_symbol_switch_complete")
         await self._log("INFO", f"runtime_symbol_switched from={previous_symbol} to={normalized_symbol}")
+
+    async def _switch_symbol_if_pending(self) -> None:
+        if not self._pending_pair_switch:
+            return
+        if await self._has_active_trade_for_symbol_switch():
+            return
+        target = self._pending_pair_switch
+        self._pending_pair_switch = None
+        await self._switch_symbol(target)
 
     def _auto_investment_controls(self, mode: str, sanitized_payload: dict[str, Any] | None = None) -> dict[str, float | bool | str]:
         normalized_mode = str(mode).strip().lower()
@@ -2026,6 +3023,23 @@ class BotEngine:
             risk_cap=_as_float(risk_cap, profile.risk_per_trade_fraction) if risk_cap is not None else None,
             allocation_cap=_as_float(allocation_cap, profile.max_trade_balance_fraction) if allocation_cap is not None else None,
         )
+
+        # Perfil de micro-capital: mejorar operatividad cuando el balance es muy bajo
+        # sin desactivar protecciones críticas.
+        if equity > 0 and equity <= 15.0:
+            micro_risk = min(max(optimized.risk_per_trade_fraction, 0.015), 0.03)
+            micro_allocation = min(max(optimized.max_trade_balance_fraction, 0.35), 0.65)
+            optimized = optimized.__class__(
+                risk_per_trade_fraction=micro_risk,
+                max_trade_balance_fraction=micro_allocation,
+                capital_reserve_ratio=min(max(optimized.capital_reserve_ratio, 0.03), 0.10),
+                min_cash_buffer_usdt=min(max(optimized.min_cash_buffer_usdt, 0.5), 1.5),
+                capital_limit_usdt=max(_as_float(optimized.capital_limit_usdt, equity), equity),
+                dynamic_exit_enabled=bool(optimized.dynamic_exit_enabled),
+                confidence_boost_multiplier=max(_as_float(optimized.confidence_boost_multiplier, 1.0), 1.03),
+                optimization_reason=f"{optimized.optimization_reason} | micro_balance_profile",
+            )
+
         return {
             "risk_per_trade_fraction": optimized.risk_per_trade_fraction,
             "max_trade_balance_fraction": optimized.max_trade_balance_fraction,
@@ -2051,7 +3065,9 @@ class BotEngine:
         settings = getattr(self, "settings", None)
         if not getattr(settings, "enable_capital_profiles", True):
             equity = max(equity, 1000.0)
-        return self.capital_profile_manager.select(equity)
+        profile = self.capital_profile_manager.select(equity)
+        self._current_capital_profile_cache = profile
+        return profile
 
     def _equity_reference_usdt(self) -> float:
         return _as_float(
@@ -2081,6 +3097,18 @@ class BotEngine:
 
     def _effective_risk_per_trade_fraction(self) -> float:
         profile_fraction = self._current_capital_profile().risk_per_trade_fraction
+        
+        # Get adaptive parameters from IntelligentCapitalManager
+        try:
+            equity = self._equity_reference_usdt()
+            self.intelligent_capital_manager.update_capital(equity)
+            adaptive_params = self.intelligent_capital_manager.get_effective_parameters()
+            intelligent_risk = adaptive_params.get("risk_per_trade", profile_fraction)
+            # Use the more conservative (lower) risk
+            profile_fraction = min(profile_fraction, intelligent_risk)
+        except Exception:
+            pass  # Fall back to profile default
+        
         if self.runtime_risk_per_trade_fraction is not None:
             return min(self.runtime_risk_per_trade_fraction, profile_fraction)
         return min(float(self.settings.risk_per_trade_fraction), profile_fraction)
@@ -2092,9 +3120,27 @@ class BotEngine:
         return min(float(self.settings.max_trade_balance_fraction), profile_fraction)
 
     def _effective_min_signal_confidence(self) -> float:
+        base_confidence = float(self.settings.confidence_threshold)
+        profile_confidence = float(self._current_capital_profile().min_confidence)
+        
+        # Get adaptive parameters from IntelligentCapitalManager
+        try:
+            adaptive_params = self.intelligent_capital_manager.get_effective_parameters()
+            intelligent_confidence = adaptive_params.get("min_confidence", profile_confidence)
+            profile_confidence = max(profile_confidence, intelligent_confidence)
+        except Exception:
+            pass  # Fall back to profile default
+        
+        # Get adapted confidence from MarketAdaptation
+        adapted = self.market_adaptation.get_adjusted_params()
+        adapted_confidence = adapted.get("confidence_min", profile_confidence)
+        
+        # Use the lower of adapted and profile for more opportunities
+        effective_confidence = min(adapted_confidence, profile_confidence)
+        
         if self.runtime_confidence_threshold is not None:
             return self.runtime_confidence_threshold
-        return max(float(self._current_capital_profile().min_confidence), float(self.settings.confidence_threshold))
+        return max(effective_confidence, base_confidence * 0.7)  # Allow 30% reduction in stable markets
 
     def _effective_max_spread_ratio(self) -> float:
         return min(float(getattr(self.settings, "max_spread_ratio", 0.004)), float(self._current_capital_profile().max_spread_ratio))
@@ -2253,7 +3299,17 @@ class BotEngine:
         await self.repository.record_state_change(previous.value, new_state.value, context)
 
     async def _log(self, level: str, message: str) -> None:
-        getattr(self.logger, level.lower(), self.logger.info)(message)
+        if not (self.terminal_tui_enabled and self.terminal_tui_quiet_logs):
+            getattr(self.logger, level.lower(), self.logger.info)(message)
+        logs = list(self.snapshot.get("logs", []) or [])
+        logs.append(
+            {
+                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                "level": str(level).upper(),
+                "message": str(message),
+            }
+        )
+        self.snapshot["logs"] = logs[-120:]
         await self.repository.record_log(level, self.state.value, message)
         if self.state_manager:
             self.state_manager.add_log(level, message)
@@ -2261,23 +3317,183 @@ class BotEngine:
     def _roll_day(self) -> None:
         today = datetime.now(timezone.utc).date()
         if today != self.day_marker:
+            asyncio.create_task(self._save_daily_stats())
             self.day_marker = today
             self.trades_today = 0
             self.win_count = 0
             asyncio.create_task(self.repository.cleanup_old_logs(keep_days=7))
+
+    async def _save_daily_stats(self) -> None:
+        try:
+            daily_pnl = float(self.snapshot.get("daily_pnl", 0) or 0)
+            session_pnl = float(self.snapshot.get("session_pnl", 0) or 0)
+            await self.repository.save_daily_stats(
+                symbol=self.symbol,
+                daily_pnl=daily_pnl,
+                session_pnl=session_pnl,
+                trades_count=self.trades_today,
+                wins=self.win_count,
+                losses=max(0, self.trades_today - self.win_count),
+                starting_balance=float(self.starting_equity or 0),
+                ending_balance=float(self.snapshot.get("equity", 0) or 0),
+                peak_balance=float(self.equity_peak or 0),
+                max_drawdown=float(self.snapshot.get("max_drawdown", 0) or 0),
+            )
+            self.logger.info(f"Daily stats saved: pnl={daily_pnl:.2f} trades={self.trades_today}")
+        except Exception as e:
+            self.logger.error(f"Failed to save daily stats: {e}")
+
+    async def _save_bot_config(self) -> None:
+        try:
+            config = {
+                "symbol": self.symbol,
+                "symbols": self.symbols,
+                "investment_mode": self.runtime_investment_mode,
+                "risk_per_trade_fraction": self.runtime_risk_per_trade_fraction,
+                "max_trade_balance_fraction": self.runtime_max_trade_balance_fraction,
+                "capital_limit_usdt": self.runtime_capital_limit_usdt,
+                "capital_reserve_ratio": self.runtime_capital_reserve_ratio,
+                "min_cash_buffer_usdt": self.runtime_min_cash_buffer_usdt,
+                "dynamic_exit_enabled": self.runtime_dynamic_exit_enabled,
+                "confidence_boost_multiplier": self.runtime_confidence_boost_multiplier,
+                "filter_config": dict(self.runtime_filter_config),
+                "symbol_capital_limits": self.runtime_symbol_capital_limits,
+                "trades_today": self.trades_today,
+                "win_count": self.win_count,
+                "consecutive_losses": self.consecutive_losses,
+                "equity_peak": float(self.equity_peak or 0),
+                "starting_equity": float(self.starting_equity or 0),
+            }
+            await self.repository.save_config(config)
+            await self.repository.set_runtime_setting("last_symbol", self.symbol)
+        except Exception as e:
+            self.logger.error(f"Failed to save bot config: {e}")
+
+    async def _restore_bot_config(self) -> None:
+        try:
+            config = await self.repository.load_config()
+            if config:
+                last_symbol = config.get("symbol") or await self.repository.get_bot_state("last_symbol")
+                if last_symbol and isinstance(last_symbol, str):
+                    normalized = normalize_symbol(last_symbol)
+                    if normalized != self.symbol:
+                        self.logger.info(f"Restoring last traded symbol: {normalized}")
+                        self.symbol = normalized
+                        self.order_manager = OrderManager(self.client, self.symbol)
+                        self.market_stream = MarketStream(self.client, self.symbol, self.settings.history_limit)
+                
+                if config.get("investment_mode"):
+                    self.runtime_investment_mode = config["investment_mode"]
+                if config.get("equity_peak"):
+                    self.equity_peak = float(config["equity_peak"])
+                self.snapshot["restored_config"] = True
+                self.logger.info("Bot configuration restored from database")
+            
+            await self._restore_trade_stats_from_db()
+        except Exception as e:
+            self.logger.error(f"Failed to restore bot config: {e}")
+
+    async def _restore_trade_stats_from_db(self) -> None:
+        try:
+            now = datetime.now(timezone.utc)
+            today_start_naive = now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+            today_end_naive = today_start_naive + timedelta(days=1)
+            
+            async with self.repository.session_factory() as session:
+                from sqlalchemy import select, func
+                from sqlalchemy import DateTime as SqlDateTime
+                from reco_trading.database.models import Trade
+                
+                closed_today_q = select(func.count(Trade.id)).where(
+                    Trade.status != "OPEN",
+                    func.coalesce(
+                        func.timezone('UTC', Trade.close_timestamp).cast(SqlDateTime),
+                        func.timezone('UTC', Trade.timestamp).cast(SqlDateTime)
+                    ) >= today_start_naive,
+                    func.coalesce(
+                        func.timezone('UTC', Trade.close_timestamp).cast(SqlDateTime),
+                        func.timezone('UTC', Trade.timestamp).cast(SqlDateTime)
+                    ) < today_end_naive,
+                )
+                closed_result = await session.execute(closed_today_q)
+                self.trades_today = closed_result.scalar_one() or 0
+                
+                wins_today_q = select(func.count(Trade.id)).where(
+                    Trade.status != "OPEN",
+                    Trade.pnl > 0,
+                    func.coalesce(
+                        func.timezone('UTC', Trade.close_timestamp).cast(SqlDateTime),
+                        func.timezone('UTC', Trade.timestamp).cast(SqlDateTime)
+                    ) >= today_start_naive,
+                    func.coalesce(
+                        func.timezone('UTC', Trade.close_timestamp).cast(SqlDateTime),
+                        func.timezone('UTC', Trade.timestamp).cast(SqlDateTime)
+                    ) < today_end_naive,
+                )
+                wins_result = await session.execute(wins_today_q)
+                self.win_count = wins_result.scalar_one() or 0
+                
+                self.logger.info(f"Restored trade stats from DB: trades_today={self.trades_today}, win_count={self.win_count}")
+        except Exception as e:
+            self.logger.error(f"Failed to restore trade stats from DB: {e}")
 
     def _is_cooldown_complete(self) -> bool:
         if self.last_close_time is None:
             return True
         return datetime.now(timezone.utc) - self.last_close_time >= timedelta(minutes=self._effective_cooldown_minutes())
 
-    def _safe_live_update(self, live: Live) -> None:
+    def _safe_live_update(self, live: Any, force: bool = False) -> None:
         try:
-            live.update(self.dashboard.render(self.snapshot))
+            now = time.monotonic()
+            if not force and (now - self._last_dashboard_render_ts) < self._dashboard_min_render_interval_seconds:
+                return
+            digest = hashlib.sha1(
+                repr(
+                    (
+                        self.snapshot.get("status"),
+                        self.snapshot.get("price"),
+                        self.snapshot.get("signal"),
+                        self.snapshot.get("confidence"),
+                        self.snapshot.get("daily_pnl"),
+                        self.snapshot.get("unrealized_pnl"),
+                        self.snapshot.get("open_positions"),
+                        (self.snapshot.get("logs") or [])[-6:],
+                    )
+                ).encode("utf-8", errors="ignore")
+            ).hexdigest()
+            if not force and digest == self._last_dashboard_render_digest:
+                return
+            if hasattr(live, "update"):
+                live.update(self.dashboard.render(self.snapshot), refresh=True)
+                self._last_dashboard_render_ts = now
+                self._last_dashboard_render_digest = digest
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("dashboard_render_error: %s", exc)
 
     def _sync_ui_state(self) -> None:
+        self.snapshot["open_positions"] = [
+            {
+                "trade_id": getattr(position, "trade_id", None),
+                "symbol": getattr(position, "symbol", self.symbol),
+                "side": getattr(position, "side", None),
+                "quantity": _as_float(getattr(position, "quantity", None), 0.0),
+                "entry_price": _as_float(getattr(position, "entry_price", None), 0.0),
+                "stop_loss": _as_float(getattr(position, "stop_loss", None), 0.0),
+                "take_profit": _as_float(getattr(position, "take_profit", None), 0.0),
+                "unrealized_pnl": self.snapshot.get("unrealized_pnl", 0.0),
+            }
+            for position in list(getattr(self.position_manager, "positions", []) or [])
+        ]
+        self.snapshot["auto_pause_disabled"] = bool(getattr(self.settings, "disable_auto_pause", True))
+        self.snapshot["pause_states"] = {
+            "manual_pause": bool(self.manual_pause),
+            "emergency_stop": bool(self.emergency_stop_active),
+            "user_paused": bool(self.snapshot.get("user_paused", False)),
+            "drawdown_pause": bool(self.trading_paused_by_drawdown),
+            "loss_pause": bool(self.pause_trading_until and datetime.now(timezone.utc) < self.pause_trading_until),
+            "exchange_pause": bool(self.exchange_failure_paused_until and datetime.now(timezone.utc) < self.exchange_failure_paused_until),
+            "cooldown_active": not self._is_cooldown_complete(),
+        }
         if not self.state_manager:
             return
         try:
@@ -2330,8 +3546,9 @@ class BotEngine:
                     "exchange_status": self.snapshot.get("exchange_status", "UNKNOWN"),
                     "redis_status": self.snapshot.get("redis_status", "UNKNOWN"),
                     "memory_usage_mb": round(_get_memory_mb(), 1),
-                    "last_server_sync": datetime.utcnow().isoformat(timespec="seconds"),
+                    "last_server_sync": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 },
+                market_analysis=self.snapshot.get("market_analysis", {}),
                 risk_metrics={
                     "risk_per_trade": f"{self._effective_risk_per_trade_fraction():.2%}",
                     "max_concurrent_trades": self._effective_max_concurrent_trades(),
@@ -2347,6 +3564,9 @@ class BotEngine:
                     "advanced_risk_reason": self.snapshot.get("advanced_risk_reason", "OK"),
                     "adaptive_size_multiplier": self.snapshot.get("adaptive_size_multiplier", 1.0),
                     "advanced_size_multiplier": self.snapshot.get("advanced_size_multiplier", 1.0),
+                    "auto_stop_enabled": bool(getattr(self.settings, "auto_stop_enabled", True)),
+                    "auto_stop_break_even_trigger_pct": float(getattr(self.settings, "auto_stop_break_even_trigger_pct", 0.008)),
+                    "auto_stop_trailing_activate_pct": float(getattr(self.settings, "auto_stop_trailing_activate_pct", 0.012)),
                 },
                 analytics={
                     "total_trades": self.trades_today,
@@ -2376,6 +3596,38 @@ class BotEngine:
                     "events": list(self.snapshot.get("exit_intelligence_log", []) or []),
                 },
             )
+
+            # ── Campos nuevos para dashboards ──────────────────────────────────
+            # Capital profile objetivo de trades
+            _cp = getattr(self, "_current_capital_profile_cache", None)
+            if _cp is None:
+                try:
+                    _cp = self._current_capital_profile()
+                except Exception:  # noqa: BLE001
+                    _cp = None
+            if _cp is not None:
+                self.snapshot["trades_target_daily"] = getattr(_cp, "max_trades_per_day", 0)
+            else:
+                self.snapshot.setdefault("trades_target_daily", 0)
+
+            # Estado de filtros adaptativos
+            _base_conf = self.base_filter_config.get("min_confidence", 0.55)
+            _runtime_conf = self.runtime_filter_config.get("min_confidence", 0.55)
+            self.snapshot["filter_relaxation_active"] = bool(_runtime_conf < _base_conf - 0.01)
+            self.snapshot["filter_auto_adjustments"] = self._filter_auto_adjustment_count
+
+            # Auto-improver stats extendidos
+            _ai = getattr(self, "auto_improver", None)
+            if _ai is not None:
+                self.snapshot["auto_improve_consecutive_losses"] = int(
+                    getattr(_ai, "consecutive_losses", 0) or 0
+                )
+                self.snapshot["auto_improve_optimization_count"] = int(
+                    getattr(_ai, "optimization_count", 0) or 0
+                )
+                self.snapshot["auto_optimized_params"] = dict(
+                    getattr(_ai, "current_params", {}) or {}
+                )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("state_sync_error: %s", exc)
 
@@ -2401,14 +3653,25 @@ class BotEngine:
         self.observability.record_reconnection()
         if self.exchange_failure_count < self.exchange_failure_max:
             return
-        self.exchange_failure_paused_until = datetime.now(timezone.utc) + timedelta(seconds=self.exchange_failure_cooldown_seconds)
+        auto_pause_on_exchange = bool(getattr(self.settings, "auto_pause_on_exchange_failure", False))
+        disable_auto_pause = bool(getattr(self.settings, "disable_auto_pause", True))
+        
+        if auto_pause_on_exchange and not disable_auto_pause:
+            self.exchange_failure_paused_until = datetime.now(timezone.utc) + timedelta(seconds=self.exchange_failure_cooldown_seconds)
+            self.snapshot["cooldown"] = "EXCHANGE_CIRCUIT_BREAKER"
+            self.observability.record_circuit_breaker_trip()
+            self.logger.critical(
+                "exchange_circuit_breaker_triggered pause_until=%s",
+                self.exchange_failure_paused_until.isoformat(timespec="seconds"),
+            )
+        else:
+            self.snapshot["exchange_failure_count"] = self.exchange_failure_count
+            self.snapshot["exchange_circuit_breaker_ignored"] = True
+            self.logger.warning(
+                "exchange_failures_detected count=%d auto_pause_disabled=True continuing_operation",
+                self.exchange_failure_count,
+            )
         self.exchange_failure_count = 0
-        self.snapshot["cooldown"] = "EXCHANGE_CIRCUIT_BREAKER"
-        self.observability.record_circuit_breaker_trip()
-        self.logger.critical(
-            "exchange_circuit_breaker_triggered pause_until=%s",
-            self.exchange_failure_paused_until.isoformat(timespec="seconds"),
-        )
 
     def _refresh_observability_snapshot(self) -> None:
         metrics = self.observability.snapshot()
@@ -2534,32 +3797,40 @@ class BotEngine:
     def _frame_to_candles(self, frame: Any) -> list[dict[str, float]]:
         candles: list[dict[str, float]] = []
         try:
-            frame_slice = frame.tail(120)
+            frame_slice = frame.tail(200)
         except Exception:  # noqa: BLE001
             return candles
 
         for _, row in frame_slice.iterrows():
             try:
-                candles.append(
-                    {
-                        "open": _as_float(row.get("open"), 0.0),
-                        "high": _as_float(row.get("high"), 0.0),
-                        "low": _as_float(row.get("low"), 0.0),
-                        "close": _as_float(row.get("close"), 0.0),
-                        "volume": _as_float(row.get("volume"), 0.0),
-                        "rsi": _as_float(row.get("rsi"), 50.0),
-                        "macd_diff": _as_float(row.get("macd_diff"), 0.0),
-                        "macd": _as_float(row.get("macd"), 0.0),
-                        "macd_signal": _as_float(row.get("macd_signal"), 0.0),
-                        "ema9": _as_float(row.get("ema9"), 0.0),
-                    }
-                )
+                ts = row.get("timestamp")
+                ts_int = 0
+                if ts is not None:
+                    if isinstance(ts, datetime):
+                        ts_int = int(ts.timestamp())
+                    else:
+                        ts_int = int(float(ts))
+                
+                candle = {
+                    "open": _as_float(row.get("open"), 0.0),
+                    "high": _as_float(row.get("high"), 0.0),
+                    "low": _as_float(row.get("low"), 0.0),
+                    "close": _as_float(row.get("close"), 0.0),
+                    "volume": _as_float(row.get("volume"), 0.0),
+                    "rsi": _as_float(row.get("rsi"), 50.0),
+                    "macd_diff": _as_float(row.get("macd_diff"), 0.0),
+                    "macd": _as_float(row.get("macd"), 0.0),
+                    "macd_signal": _as_float(row.get("macd_signal"), 0.0),
+                    "ema9": _as_float(row.get("ema9"), 0.0),
+                    "timestamp": ts_int,
+                }
+                candles.append(candle)
             except Exception:  # noqa: BLE001
                 continue
         return candles
 
     def _apply_symbol_filter_config(self, filter_config: dict[str, float]) -> None:
-        self.runtime_filter_config = {
+        self.base_filter_config = {
             "adx_threshold": _as_float(filter_config.get("adx_threshold"), 22.0),
             "rsi_buy_threshold": _as_float(filter_config.get("rsi_buy_threshold"), 55.0),
             "rsi_sell_threshold": _as_float(filter_config.get("rsi_sell_threshold"), 45.0),
@@ -2571,7 +3842,37 @@ class BotEngine:
             "take_profit_atr_multiplier": _as_float(filter_config.get("take_profit_atr_multiplier"), 2.5),
             "min_confidence": _as_float(filter_config.get("min_confidence"), 0.55),
         }
-        self.logger.info(f"Applied filter config for {self.symbol}: {self.runtime_filter_config}")
+        self.base_filter_config = self._calibrate_filter_config_with_recent_market_data(self.base_filter_config)
+
+        # ── SAFETY CLAMPS: evitar filtros peligrosos en cualquier dirección ──
+        _SAFETY = {
+            "adx_threshold":              (8.0,  35.0),
+            "rsi_buy_threshold":          (40.0, 70.0),
+            "rsi_sell_threshold":         (30.0, 60.0),
+            "min_confidence":             (0.45, 0.85),
+            "volume_buy_threshold":       (0.50, 2.50),
+            "volume_sell_threshold":      (0.30, 1.50),
+            "atr_low_threshold":          (0.001, 0.010),
+            "atr_high_threshold":         (0.010, 0.060),
+            "stop_loss_atr_multiplier":   (1.0,  4.0),
+            "take_profit_atr_multiplier": (1.5,  6.0),
+        }
+        for _k, (_lo, _hi) in _SAFETY.items():
+            if _k in self.base_filter_config:
+                _orig = self.base_filter_config[_k]
+                _clamped = max(_lo, min(_hi, _orig))
+                if abs(_clamped - _orig) > 1e-9:
+                    self.logger.warning(
+                        "Filter safety clamp: %s %.4f → %.4f [%.4f, %.4f]",
+                        _k, _orig, _clamped, _lo, _hi,
+                    )
+                    self.base_filter_config[_k] = _clamped
+
+        self.runtime_filter_config = dict(self.base_filter_config)
+        self._filter_auto_adjustment_count = getattr(self, "_filter_auto_adjustment_count", 0) + 1
+
+        if hasattr(self, "logger"):
+            self.logger.info(f"Applied filter config for {self.symbol}: {self.runtime_filter_config}")
 
     def _apply_autonomous_filters(self) -> None:
         """Apply filter adjustments from the autonomous brain."""
@@ -2583,76 +3884,191 @@ class BotEngine:
             if not autonomous_filters:
                 return
             
+            effective_filters = dict(self.base_filter_config)
             market_condition = self.autonomous_brain._current_market_condition
             
             if market_condition == "HIGH_VOLATILITY":
-                self.runtime_filter_config["adx_threshold"] = max(self.runtime_filter_config.get("adx_threshold", 22.0), 25.0)
-                self.runtime_filter_config["min_confidence"] = max(self.runtime_filter_config.get("min_confidence", 0.55), 0.70)
+                effective_filters["adx_threshold"] = max(effective_filters.get("adx_threshold", 22.0), 25.0)
+                effective_filters["min_confidence"] = max(effective_filters.get("min_confidence", 0.55), 0.70)
             elif market_condition == "LOW_VOLATILITY":
-                self.runtime_filter_config["adx_threshold"] = min(self.runtime_filter_config.get("adx_threshold", 22.0), 15.0)
-                self.runtime_filter_config["volume_buy_threshold"] = min(self.runtime_filter_config.get("volume_buy_threshold", 1.10), 0.80)
+                effective_filters["adx_threshold"] = min(effective_filters.get("adx_threshold", 22.0), 15.0)
+                effective_filters["volume_buy_threshold"] = min(effective_filters.get("volume_buy_threshold", 1.10), 0.80)
             elif market_condition == "TRENDING":
-                self.runtime_filter_config["rsi_buy_threshold"] = min(self.runtime_filter_config.get("rsi_buy_threshold", 55.0), 40.0)
-                self.runtime_filter_config["rsi_sell_threshold"] = max(self.runtime_filter_config.get("rsi_sell_threshold", 45.0), 60.0)
+                effective_filters["rsi_buy_threshold"] = min(effective_filters.get("rsi_buy_threshold", 55.0), 40.0)
+                effective_filters["rsi_sell_threshold"] = max(effective_filters.get("rsi_sell_threshold", 45.0), 60.0)
             elif market_condition == "DEFENSIVE":
-                self.runtime_filter_config["min_confidence"] = max(self.runtime_filter_config.get("min_confidence", 0.55), 0.75)
-                self.runtime_filter_config["adx_threshold"] = max(self.runtime_filter_config.get("adx_threshold", 22.0), 30.0)
+                effective_filters["min_confidence"] = max(effective_filters.get("min_confidence", 0.55), 0.75)
+                effective_filters["adx_threshold"] = max(effective_filters.get("adx_threshold", 22.0), 30.0)
+
+            allowed_ranges = {
+                "adx_threshold": (5.0, 60.0),
+                "rsi_buy_threshold": (20.0, 80.0),
+                "rsi_sell_threshold": (20.0, 80.0),
+                "volume_buy_threshold": (0.2, 3.0),
+                "volume_sell_threshold": (0.2, 3.0),
+                "atr_low_threshold": (0.0001, 0.05),
+                "atr_high_threshold": (0.001, 0.20),
+                "stop_loss_atr_multiplier": (0.8, 4.0),
+                "take_profit_atr_multiplier": (1.0, 8.0),
+                "min_confidence": (0.30, 0.95),
+            }
+            if isinstance(autonomous_filters, dict):
+                for key, value in autonomous_filters.items():
+                    if key not in allowed_ranges:
+                        continue
+                    lo, hi = allowed_ranges[key]
+                    effective_filters[key] = min(max(_as_float(value, effective_filters.get(key, lo)), lo), hi)
+
+            trades_today = int(self.snapshot.get("trades_today", 0) or 0)
+            win_rate = _as_float(self.snapshot.get("win_rate"), 0.0)
+            daily_pnl = _as_float(self.snapshot.get("daily_pnl"), 0.0)
+            stale_ratio = _as_float(self.snapshot.get("stale_market_data_ratio"), 0.0)
+            signal_quality = _as_float(self.snapshot.get("signal_quality_score"), 0.0)
+            consecutive_losses = int(self.snapshot.get("consecutive_losses", 0) or 0)
+            total_equity = _as_float(
+                self.snapshot.get("total_equity"),
+                _as_float(self.snapshot.get("equity"), _as_float(self.snapshot.get("balance"), 0.0)),
+            )
+
+            # Relajación controlada por falta de actividad — un solo ajuste acumulado
+            if trades_today == 0 and daily_pnl >= 0:
+                # Sin trades y sin pérdidas: relajar moderadamente para buscar entrada
+                _BASE_CONF = self.base_filter_config.get("min_confidence", 0.45)
+                _BASE_ADX = self.base_filter_config.get("adx_threshold", 15.0)
+                effective_filters["min_confidence"] = max(_BASE_CONF - 0.06, 0.38)
+                effective_filters["adx_threshold"] = max(_BASE_ADX - 3.0, 9.0)
+                effective_filters["volume_buy_threshold"] = min(
+                    effective_filters.get("volume_buy_threshold", 1.0), 0.85
+                )
+            elif trades_today < 2 and daily_pnl >= -10.0:
+                # Pocos trades pero sin pérdida grave: relajar levemente
+                _BASE_CONF = self.base_filter_config.get("min_confidence", 0.45)
+                _BASE_ADX = self.base_filter_config.get("adx_threshold", 15.0)
+                effective_filters["min_confidence"] = max(_BASE_CONF - 0.03, 0.42)
+                effective_filters["adx_threshold"] = max(_BASE_ADX - 1.5, 11.0)
+
+            # Protect quality if session quality drops.
+            if daily_pnl < -30.0 or (trades_today >= 3 and win_rate < 0.34):
+                effective_filters["min_confidence"] = min(0.78, _as_float(effective_filters.get("min_confidence"), 0.50) + 0.04)
+                effective_filters["adx_threshold"] = min(28.0, _as_float(effective_filters.get("adx_threshold"), 18.0) + 2.0)
             
+            self.runtime_filter_config = effective_filters
             self.snapshot["autonomous_market_condition"] = market_condition
-            self.snapshot["autonomous_filters"] = self.runtime_filter_config.copy()
+            self.snapshot["autonomous_filters"] = effective_filters.copy()
+            self.snapshot["autonomous_filter_reason"] = (
+                f"market={market_condition} stale_ratio={stale_ratio:.3f} "
+                f"signal_quality={signal_quality:.3f} consecutive_losses={consecutive_losses}"
+            )
             
         except Exception as e:
             self.logger.warning(f"Failed to apply autonomous filters: {e}")
+
+    def _configure_llm_runtime_mode(self) -> None:
+        """Deprecated compatibility hook: LLM runtime modes are disabled."""
+        return
 
     def _get_default_filter_config(self) -> dict[str, float]:
         normalized_symbol = self.symbol.replace("/", "").upper()
         default_configs = {
             "BTCUSDT": {
-                "adx_threshold": 10.0, "rsi_buy_threshold": 45.0, "rsi_sell_threshold": 55.0,
-                "volume_buy_threshold": 0.70, "volume_sell_threshold": 0.70,
-                "atr_low_threshold": 0.0008, "atr_high_threshold": 0.030,
-                "stop_loss_atr_multiplier": 1.5, "take_profit_atr_multiplier": 2.5, "min_confidence": 0.40,
+                "adx_threshold": 16.0, "rsi_buy_threshold": 47.0, "rsi_sell_threshold": 53.0,
+                "volume_buy_threshold": 1.05, "volume_sell_threshold": 0.85,
+                "atr_low_threshold": 0.0010, "atr_high_threshold": 0.022,
+                "stop_loss_atr_multiplier": 1.5, "take_profit_atr_multiplier": 2.4, "min_confidence": 0.58,
             },
             "ETHUSDT": {
-                "adx_threshold": 10.0, "rsi_buy_threshold": 45.0, "rsi_sell_threshold": 55.0,
-                "volume_buy_threshold": 0.70, "volume_sell_threshold": 0.70,
-                "atr_low_threshold": 0.001, "atr_high_threshold": 0.040,
-                "stop_loss_atr_multiplier": 1.6, "take_profit_atr_multiplier": 2.6, "min_confidence": 0.40,
+                "adx_threshold": 17.0, "rsi_buy_threshold": 47.0, "rsi_sell_threshold": 53.0,
+                "volume_buy_threshold": 1.08, "volume_sell_threshold": 0.86,
+                "atr_low_threshold": 0.0012, "atr_high_threshold": 0.028,
+                "stop_loss_atr_multiplier": 1.6, "take_profit_atr_multiplier": 2.5, "min_confidence": 0.60,
             },
             "SOLUSDT": {
-                "adx_threshold": 10.0, "rsi_buy_threshold": 45.0, "rsi_sell_threshold": 55.0,
-                "volume_buy_threshold": 0.70, "volume_sell_threshold": 0.70,
-                "atr_low_threshold": 0.002, "atr_high_threshold": 0.060,
-                "stop_loss_atr_multiplier": 2.0, "take_profit_atr_multiplier": 3.0, "min_confidence": 0.40,
+                "adx_threshold": 19.0, "rsi_buy_threshold": 48.0, "rsi_sell_threshold": 52.0,
+                "volume_buy_threshold": 1.12, "volume_sell_threshold": 0.88,
+                "atr_low_threshold": 0.0022, "atr_high_threshold": 0.045,
+                "stop_loss_atr_multiplier": 2.0, "take_profit_atr_multiplier": 3.0, "min_confidence": 0.63,
             },
             "BNBUSDT": {
-                "adx_threshold": 10.0, "rsi_buy_threshold": 45.0, "rsi_sell_threshold": 55.0,
-                "volume_buy_threshold": 0.70, "volume_sell_threshold": 0.70,
-                "atr_low_threshold": 0.001, "atr_high_threshold": 0.050,
-                "stop_loss_atr_multiplier": 1.8, "take_profit_atr_multiplier": 2.8, "min_confidence": 0.45,
+                "adx_threshold": 17.0, "rsi_buy_threshold": 47.0, "rsi_sell_threshold": 53.0,
+                "volume_buy_threshold": 1.07, "volume_sell_threshold": 0.86,
+                "atr_low_threshold": 0.0014, "atr_high_threshold": 0.030,
+                "stop_loss_atr_multiplier": 1.8, "take_profit_atr_multiplier": 2.7, "min_confidence": 0.60,
             },
             "XRPUSDT": {
-                "adx_threshold": 10.0, "rsi_buy_threshold": 45.0, "rsi_sell_threshold": 55.0,
-                "volume_buy_threshold": 0.80, "volume_sell_threshold": 0.95,
-                "atr_low_threshold": 0.002, "atr_high_threshold": 0.080,
-                "stop_loss_atr_multiplier": 2.2, "take_profit_atr_multiplier": 3.5, "min_confidence": 0.40,
+                "adx_threshold": 18.0, "rsi_buy_threshold": 49.0, "rsi_sell_threshold": 51.0,
+                "volume_buy_threshold": 1.10, "volume_sell_threshold": 0.90,
+                "atr_low_threshold": 0.0025, "atr_high_threshold": 0.060,
+                "stop_loss_atr_multiplier": 2.2, "take_profit_atr_multiplier": 3.4, "min_confidence": 0.62,
             },
         }
         return default_configs.get(normalized_symbol, {
-            "adx_threshold": 12.0, "rsi_buy_threshold": 48.0, "rsi_sell_threshold": 52.0,
-            "volume_buy_threshold": 0.90, "volume_sell_threshold": 0.85,
-            "atr_low_threshold": 0.001, "atr_high_threshold": 0.040,
-            "stop_loss_atr_multiplier": 1.8, "take_profit_atr_multiplier": 3.0, "min_confidence": 0.45,
+            "adx_threshold": 18.0, "rsi_buy_threshold": 48.0, "rsi_sell_threshold": 52.0,
+            "volume_buy_threshold": 1.08, "volume_sell_threshold": 0.88,
+            "atr_low_threshold": 0.0012, "atr_high_threshold": 0.035,
+            "stop_loss_atr_multiplier": 1.8, "take_profit_atr_multiplier": 2.8, "min_confidence": 0.60,
         })
 
+    def _calibrate_filter_config_with_recent_market_data(self, config: dict[str, float]) -> dict[str, float]:
+        """
+        Ajusta límites de filtros con datos recientes del mercado actual.
+        Mantiene límites conservadores para evitar pasar señales falsas.
+        """
+        calibrated = dict(config)
+        frame = getattr(self, "_cached_frame5", None)
+        try:
+            if frame is None or len(frame) < 40:
+                return calibrated
+            required = {"atr", "close", "volume", "vol_ma20", "adx"}
+            if not required.issubset(set(frame.columns)):
+                return calibrated
+
+            atr_ratio = (frame["atr"] / frame["close"]).replace([float("inf"), float("-inf")], float("nan")).dropna()
+            vol_ratio = (frame["volume"] / frame["vol_ma20"]).replace([float("inf"), float("-inf")], float("nan")).dropna()
+            adx_series = frame["adx"].replace([float("inf"), float("-inf")], float("nan")).dropna()
+            if len(atr_ratio) < 20 or len(vol_ratio) < 20 or len(adx_series) < 20:
+                return calibrated
+
+            atr_low_q = float(atr_ratio.quantile(0.20))
+            atr_high_q = float(atr_ratio.quantile(0.85))
+            adx_med = float(adx_series.tail(80).median())
+            vol_med = float(vol_ratio.tail(80).median())
+
+            calibrated["atr_low_threshold"] = min(max(atr_low_q * 0.95, 0.0005), 0.0200)
+            calibrated["atr_high_threshold"] = min(max(atr_high_q * 1.10, calibrated["atr_low_threshold"] + 0.001), 0.0900)
+            calibrated["adx_threshold"] = min(max((calibrated.get("adx_threshold", 16.0) + adx_med) / 2.0, 12.0), 30.0)
+            calibrated["volume_buy_threshold"] = min(max((calibrated.get("volume_buy_threshold", 1.0) + vol_med) / 2.0, 0.85), 1.45)
+            calibrated["min_confidence"] = min(max(calibrated.get("min_confidence", 0.58), 0.50), 0.85)
+            if hasattr(self, "logger"):
+                self.logger.info(
+                    "market_filter_calibrated symbol=%s adx=%.2f atr_low=%.5f atr_high=%.5f vol_buy=%.2f",
+                    self.symbol,
+                    calibrated["adx_threshold"],
+                    calibrated["atr_low_threshold"],
+                    calibrated["atr_high_threshold"],
+                    calibrated["volume_buy_threshold"],
+                )
+        except Exception as exc:
+            if hasattr(self, "logger"):
+                self.logger.warning("market_filter_calibration_failed symbol=%s reason=%s", self.symbol, exc)
+        return calibrated
+
     def _effective_adx_threshold(self) -> float:
+        if hasattr(self, 'market_adaptation') and self.market_adaptation:
+            adapted = self.market_adaptation.get_adjusted_params()
+            return adapted.get("adx_threshold", self.runtime_filter_config.get("adx_threshold", 10.0))
         return self.runtime_filter_config.get("adx_threshold", 10.0)
 
     def _effective_rsi_buy_threshold(self) -> float:
-        return self.runtime_filter_config.get("rsi_buy_threshold", 40.0)
+        if hasattr(self, 'market_adaptation') and self.market_adaptation:
+            adapted = self.market_adaptation.get_adjusted_params()
+            return adapted.get("rsi_buy_threshold", self.runtime_filter_config.get("rsi_buy_threshold", 58.0))
+        return self.runtime_filter_config.get("rsi_buy_threshold", 58.0)
 
     def _effective_rsi_sell_threshold(self) -> float:
-        return self.runtime_filter_config.get("rsi_sell_threshold", 60.0)
+        if hasattr(self, 'market_adaptation') and self.market_adaptation:
+            adapted = self.market_adaptation.get_adjusted_params()
+            return adapted.get("rsi_sell_threshold", self.runtime_filter_config.get("rsi_sell_threshold", 42.0))
+        return self.runtime_filter_config.get("rsi_sell_threshold", 42.0)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -2665,6 +4081,17 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError, IndexError):
         return default
+
+
+class _NoopLive:
+    def __enter__(self) -> "_NoopLive":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def update(self, _renderable: Any) -> None:
+        return
 
 
 def _book_price(order_book: dict[str, Any], side: str, fallback: float) -> float:

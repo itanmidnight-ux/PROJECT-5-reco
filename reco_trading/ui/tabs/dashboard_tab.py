@@ -69,19 +69,11 @@ class DashboardTab(QWidget):
 
         self.top_bar = QLabel("BTC/USDT | - | NEUTRAL | INITIALIZING")
         self.top_bar.setObjectName("statusRibbon")
-        self.top_bar.setStyleSheet(
-            "padding:8px 12px; border-radius:12px; "
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1f2a44, stop:1 #111827);"
-            "color:#d9e6ff; border:1px solid #2f3b59;"
-        )
         root.addWidget(self.top_bar)
 
         self.capital_banner = QLabel("Profile UNKNOWN • Operable capital -- • Reserve --")
         self.capital_banner.setObjectName("smallMetricValue")
         self.capital_banner.setWordWrap(True)
-        self.capital_banner.setStyleSheet(
-            "padding:6px 10px; border-radius:10px; background:#111827; border:1px solid #243049; color:#b8c7e3;"
-        )
         root.addWidget(self.capital_banner)
 
         self.hero_panel = self._panel()
@@ -187,14 +179,6 @@ class DashboardTab(QWidget):
         self.execution_insight.setWordWrap(True)
         self.execution_insight.setObjectName("metricLabel")
         activity_layout.addWidget(self.execution_insight)
-        self.health_label = QLabel("Health: waiting metrics")
-        self.health_label.setWordWrap(True)
-        self.health_label.setObjectName("metricLabel")
-        activity_layout.addWidget(self.health_label)
-        self.decision_trace_label = QLabel("Decision trace unavailable")
-        self.decision_trace_label.setWordWrap(True)
-        self.decision_trace_label.setObjectName("metricLabel")
-        activity_layout.addWidget(self.decision_trace_label)
 
         self.chart_panel = self._panel()
         self.chart_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -269,12 +253,6 @@ class DashboardTab(QWidget):
     def _panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("panelCard")
-        panel.setStyleSheet(
-            "QFrame#panelCard {"
-            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #131c2e, stop:1 #0f172a);"
-            "border:1px solid #243049; border-radius:14px;"
-            "}"
-        )
         return panel
 
     def _title(self, title: str) -> QLabel:
@@ -314,11 +292,7 @@ class DashboardTab(QWidget):
         self.top_bar.setText(
             f"{pair}  •  Price {price}  •  {signal} {confidence}%  •  {status.replace('_', ' ').title()}"
         )
-        self.top_bar.setStyleSheet(
-            "padding:8px 12px; border-radius:12px; "
-            "background:qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1f2a44, stop:1 #111827); "
-            f"color: {status_color(status)}; border:1px solid #2f3b59;"
-        )
+        self.top_bar.setStyleSheet(f"color: {status_color(status)};")
         capital_profile = str(state.get("capital_profile") or risk_metrics.get("capital_profile") or "UNKNOWN")
         operable_capital = _as_float(state.get("operable_capital_usdt", risk_metrics.get("operable_capital_usdt")), 0.0)
         reserve_ratio = _as_float(state.get("capital_reserve_ratio", risk_metrics.get("capital_reserve_ratio")), 0.0)
@@ -326,10 +300,6 @@ class DashboardTab(QWidget):
         self.capital_banner.setText(
             f"Profile {capital_profile} • Operable capital {_fmt_num(operable_capital, 2)} USDT • "
             f"Reserve {reserve_ratio * 100:.1f}% • Buffer {_fmt_num(cash_buffer, 2)} USDT"
-        )
-        banner_tint = "#16324f" if operable_capital > 0 else "#4a2c2c"
-        self.capital_banner.setStyleSheet(
-            f"padding:6px 10px; border-radius:10px; background:{banner_tint}; border:1px solid #2f3b59; color:#d6e4ff;"
         )
 
         exposure = _as_float(risk_metrics.get("current_exposure"), 0.0)
@@ -427,20 +397,6 @@ class DashboardTab(QWidget):
                 ]
             )
         )
-        latency_p95 = _as_float(state.get("api_latency_p95_ms"), 0.0)
-        stale_ratio = _as_float(state.get("stale_market_data_ratio"), 0.0)
-        reconnects = int(state.get("exchange_reconnections", 0) or 0)
-        breaker = int(state.get("circuit_breaker_trips", 0) or 0)
-        db_status = str(state.get("database_status", "UNKNOWN"))
-        ex_status = str(state.get("exchange_status", "UNKNOWN"))
-        self.health_label.setText(
-            f"Health p95={latency_p95:.1f}ms • stale={stale_ratio:.1%} • reconnect={reconnects} • CB={breaker} • DB={db_status} • EX={ex_status}"
-        )
-        trace = state.get("decision_trace", {}) or {}
-        factor_scores = trace.get("factor_scores", {}) if isinstance(trace, dict) else {}
-        compact_scores = ", ".join(f"{k}:{float(v):+.2f}" for k, v in list(factor_scores.items())[:4]) or "n/a"
-        decision_reason = str(state.get("decision_reason", "-"))
-        self.decision_trace_label.setText(f"Decision trace: {compact_scores} • reason={decision_reason}")
         self.chart.update_from_snapshot(state)
 
 

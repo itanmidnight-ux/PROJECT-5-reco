@@ -2,176 +2,144 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import os
+import sys
 import threading
 
-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
 from reco_trading.config.settings import Settings
-from reco_trading.core.bot_engine import BotEngine
+from reco_trading.core.bot_engine import BotEngine, _get_database_dsn
 from reco_trading.database.repository import Repository
+from web_site import run_in_thread as run_web_dashboard_in_thread
+from web_site.dashboard_server import set_bot_instance_getter
+
+_bot_instance: BotEngine | None = None
+_bot_runtime_error: Exception | None = None
 
 
 def configure_logging() -> None:
     logging.basicConfig(
-        level=logging.INFO, 
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
 
-def _run_bot(settings: Settings, state_manager: object | None, web_dashboard_instance: object | None = None) -> None:
-    """Run the trading bot."""
+def get_bot_instance() -> BotEngine | None:
+    return _bot_instance
+
+
+def _run_bot(settings: Settings, state_manager: object | None) -> None:
+    global _bot_instance, _bot_runtime_error
+    bot = BotEngine(settings, state_manager=state_manager)
+    _bot_instance = bot
     try:
-        if web_dashboard_instance:
-            from web_site.dashboard_server import set_bot_instance
-            set_bot_instance(web_dashboard_instance)
-        
-        bot = BotEngine(settings, state_manager=state_manager)
         asyncio.run(bot.run())
-    except Exception as e:
-        logging.getLogger(__name__).error(f"Bot error: {e}")
-        raise
+    except Exception as exc:  # noqa: BLE001
+        _bot_runtime_error = exc
+        logging.getLogger(__name__).exception("Bot terminated unexpectedly")
+    finally:
+        _bot_instance = None
 
 
-async def _verify_database_connection(settings: Settings) -> None:
-    """Verify database connection."""
-    repository = Repository(settings.postgres_dsn)
+def _join_bot_thread_or_exit(bot_thread: threading.Thread, logger: logging.Logger) -> None:
+    bot_thread.join()
+    if _bot_runtime_error is not None:
+        logger.error("Bot stopped unexpectedly: %s", _bot_runtime_error)
+        sys.exit(1)
+
+
+def _start_web_dashboard(logger: logging.Logger) -> None:
+    web_host = str(os.getenv("WEB_DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
+    web_port_raw = str(os.getenv("WEB_DASHBOARD_PORT", "9000")).strip()
     try:
-        await repository.verify_connectivity()
+        web_port = int(web_port_raw)
+    except ValueError:
+        web_port = 9000
+        logger.warning(
+            "Invalid WEB_DASHBOARD_PORT=%s; falling back to %s", web_port_raw, web_port
+        )
+
+    # El getter ya está registrado antes de llamar a run_web_dashboard_in_thread
+    run_web_dashboard_in_thread(host=web_host, port=web_port)
+    logger.info("Web dashboard thread started at http://%s:%s", web_host, web_port)
+
+
+async def _verify_database_connection(settings: Settings) -> str:
+    """Verifica la mejor DSN disponible con fallback automático a SQLite."""
+    dsn = _get_database_dsn(settings)
+    if not dsn:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        os.makedirs(os.path.join(project_root, "data"), exist_ok=True)
+        db_path = os.path.join(project_root, "data", "reco_trading.db")
+        dsn = f"sqlite+aiosqlite:///{db_path}"
+    repository = Repository(dsn)
+    try:
+        if hasattr(repository, "verify_connectivity"):
+            await repository.verify_connectivity()
+        else:
+            await repository.setup()
+        return dsn
     finally:
         await repository.close()
 
 
-def _ask_dashboard_type() -> str:
-    """Ask user to choose dashboard type."""
-    print("\n" + "="*50)
-    print("  Select Dashboard Type")
-    print("="*50)
-    print("  1. App Dashboard (PySide6 GUI)")
-    print("  2. Web Dashboard (Browser - port 9000)")
-    print("  3. Headless (No dashboard)")
-    print("="*50)
-    
-    while True:
-        choice = input("\nEnter choice (1/2/3): ").strip()
-        if choice in ['1', '2', '3']:
-            return choice
-        print("Invalid choice. Please enter 1, 2, or 3.")
-
-
 def run() -> None:
-    """Main entry point."""
     configure_logging()
     logger = logging.getLogger(__name__)
-    
+
+    global _bot_runtime_error
+    _bot_runtime_error = None
+
+    # Registrar getter ANTES de cualquier cosa para que el dashboard pueda acceder al bot
+    set_bot_instance_getter(get_bot_instance)
+
+    # Web dashboard arranca INMEDIATAMENTE, antes de cualquier validación
+    _start_web_dashboard(logger)
+
     settings = Settings()
-    
-    if not settings.postgres_dsn:
-        logger.error("POSTGRES_DSN is required")
-        sys.exit(1)
-    
-    if settings.require_api_keys and (not settings.binance_api_key or not settings.binance_api_secret):
-        logger.error("BINANCE_API_KEY and BINANCE_API_SECRET are required")
-        sys.exit(1)
-    
+
+    if settings.require_api_keys and (
+        not settings.binance_api_key or not settings.binance_api_secret
+    ):
+        logger.warning("BINANCE_API_KEY/BINANCE_API_SECRET no configuradas; el bot no operará hasta que se configuren")
     if not settings.binance_testnet and not settings.confirm_mainnet:
-        logger.error("Mainnet trading blocked: set CONFIRM_MAINNET=true to proceed")
-        sys.exit(1)
-    
+        logger.warning("Mainnet trading bloqueado: set CONFIRM_MAINNET=true para operar en mainnet")
+
+    if hasattr(settings, "terminal_tui_enabled") and not bool(
+        getattr(settings, "terminal_tui_enabled", True)
+    ):
+        logger.warning(
+            "terminal_tui_enabled=false detectado; forzando True para web+terminal dashboard"
+        )
+        setattr(settings, "terminal_tui_enabled", True)
+
+    # FIX A3: Inicializar StateManager antes de arrancar el bot
+    state_manager = None
+    try:
+        from reco_trading.ui.state_manager import StateManager  # noqa: PLC0415
+        state_manager = StateManager()
+        logger.info("StateManager initialized successfully")
+    except ImportError:
+        logger.info("StateManager not available, running without it")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("StateManager failed to initialize: %s — running without it", exc)
+
     try:
         asyncio.run(_verify_database_connection(settings))
-    except Exception as exc:
-        logger.error(
-            "Database unavailable; start PostgreSQL or fix POSTGRES_DSN before launching the bot: %s",
-            exc,
-        )
+        logger.info("Database connection verified successfully")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Database unavailable at startup: %s", exc)
         sys.exit(1)
 
-    dashboard_type = os.environ.get('DASHBOARD_TYPE', '').lower()
-    
-    if not dashboard_type:
-        dashboard_type = _ask_dashboard_type()
-    
-    if dashboard_type == '1':
-        dashboard_type = 'app'
-    elif dashboard_type == '2':
-        dashboard_type = 'web'
-    elif dashboard_type == '3':
-        dashboard_type = 'none'
-    
-    state_manager = None
-    web_dashboard_instance = None
-    bot_instance = None
-    
-    if dashboard_type == 'app':
-        try:
-            from reco_trading.ui import StateManager, run_gui
-            state_manager = StateManager()
-            logger.info("App Dashboard selected")
-        except Exception as exc:
-            logger.exception(f"App Dashboard failed: {exc}, falling back to headless")
-            dashboard_type = 'none'
-    
-    elif dashboard_type == 'web':
-        logger.info("Web Dashboard selected (port 9000)")
-        try:
-            from web_site.dashboard_server import run_in_thread, set_bot_instance_getter
-            web_dashboard_thread = run_in_thread(host='0.0.0.0', port=9000)
-            
-            def get_bot():
-                return bot_instance
-            
-            set_bot_instance_getter(get_bot)
-            logger.info("Web Dashboard started on http://localhost:9000")
-        except Exception as exc:
-            logger.exception(f"Web Dashboard failed: {exc}, running headless")
-            dashboard_type = 'none'
-    
-    if dashboard_type == 'none':
-        logger.info("Running in headless mode (no dashboard)")
-    
-    try:
-        from reco_trading.ui.bootstrap import hydrate_state_from_database
-        if state_manager:
-            asyncio.run(hydrate_state_from_database(settings, state_manager))
-    except Exception as exc:
-        logger.warning(
-            "State hydration failed; continuing with an empty UI state: %s",
-            exc,
-        )
-
-    def create_bot_with_instance():
-        nonlocal bot_instance
-        bot_instance = BotEngine(settings, state_manager=state_manager)
-        return bot_instance
-
+    # FIX A2: Bot thread arranca ANTES que Flask para que tenga tiempo de inicializarse
     bot_thread = threading.Thread(
-        target=lambda: asyncio.run(create_bot_with_instance().run()),
-        daemon=True,
-        name="bot-engine"
+        target=_run_bot, args=(settings, state_manager), daemon=True, name="bot-engine"
     )
     bot_thread.start()
-    
-    logger.info(f"Bot started with {dashboard_type} dashboard")
 
-    if dashboard_type == 'app' and state_manager:
-        try:
-            from reco_trading.ui import run_gui
-            run_gui(state_manager)
-        except Exception as exc:
-            logger.exception("GUI failed, bot will continue running: %s", exc)
-            bot_thread.join()
-    else:
-        try:
-            bot_thread.join()
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
+    try:
+        _join_bot_thread_or_exit(bot_thread, logger)
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested by user")
 
 
 if __name__ == "__main__":
