@@ -696,10 +696,10 @@ log_success "Variables de decisión actualizadas en .env"
 
 log_info "Creando estructura de directorios..."
 
-mkdir -p data logs scripts/lib
+mkdir -p data logs scripts
 
-if [[ ! -f "scripts/lib/runtime_env.sh" ]]; then
-    cat > scripts/lib/runtime_env.sh <<'RUNTIME_ENV'
+if [[ ! -f "scripts/runtime_env.sh" ]]; then
+    cat > scripts/runtime_env.sh <<'RUNTIME_ENV'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -722,7 +722,7 @@ load_runtime_env() {
 
 load_runtime_env
 RUNTIME_ENV
-    chmod +x scripts/lib/runtime_env.sh
+    chmod +x scripts/runtime_env.sh
 fi
 
 log_success "Estructura de directorios creada"

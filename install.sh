@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Uso: ./install.sh"
+  echo "Instala dependencias Python/Redis y prepara .env y PostgreSQL local."
+  exit 0
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
 # shellcheck disable=SC1091
-source "${ROOT_DIR}/scripts/lib/runtime_env.sh"
+source "${ROOT_DIR}/scripts/runtime_env.sh"
 
 if [[ "${EUID}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
   SUDO="sudo"

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
-RUNTIME_ENV_LIB="${ROOT_DIR}/scripts/lib/runtime_env.sh"
+RUNTIME_ENV_LIB="${ROOT_DIR}/scripts/runtime_env.sh"
 ensure_runtime_env_lib_exists() {
   if [[ -f "${RUNTIME_ENV_LIB}" ]]; then
     return 0
