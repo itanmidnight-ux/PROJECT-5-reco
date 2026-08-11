@@ -1,5 +1,13 @@
 # Reco Trading
 
+## Identidad pública del repositorio
+
+- **Nombre recomendado:** `reco-trading-bot`
+- **Nombre actual:** `PROJECT-5-reco`
+- **Posicionamiento:** motor de trading cripto asíncrono con filtros, riesgo, persistencia y dashboards.
+
+---
+
 Bot de trading algorítmico para cripto con arquitectura asíncrona, motor de riesgo, dashboard web en tiempo real (SSE) y dashboard terminal (Rich TUI).
 
 ## Contenido
