@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import socket
 import threading
 import time
@@ -36,7 +37,12 @@ _sock: Sock | None = None
 _connected_clients: list[Any] = []
 _connected_clients_lock = threading.Lock()
 
-JWT_SECRET = os.getenv("DASHBOARD_JWT_SECRET", "your-secret-key-change-this")
+_configured_jwt_secret = os.getenv("DASHBOARD_JWT_SECRET", "").strip()
+if not _configured_jwt_secret:
+    if os.getenv("ENVIRONMENT", "development").strip().lower() in {"production", "prod"}:
+        raise RuntimeError("DASHBOARD_JWT_SECRET is required in production")
+    _configured_jwt_secret = secrets.token_urlsafe(32)
+JWT_SECRET = _configured_jwt_secret
 JWT_EXPIRATION_HOURS = 24
 
 
@@ -60,6 +66,11 @@ def _dashboard_user() -> str:
 
 def _dashboard_password() -> str:
     return str(os.getenv("DASHBOARD_PASSWORD", "")).strip()
+
+
+def _cors_origins() -> list[str]:
+    """Return an explicit allowlist; empty means no browser origins are trusted."""
+    return [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
 
 def _create_jwt_token(username: str) -> str:
     if jwt is None:

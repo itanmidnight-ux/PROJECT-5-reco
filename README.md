@@ -1,5 +1,9 @@
 # Reco Trading
 
+> Revisión de seguridad: [SECURITY_AUDIT.md](SECURITY_AUDIT.md)
+
+[![Project focus](https://readme-typing-svg.demolab.com?font=Inter&weight=700&size=20&duration=2600&pause=700&color=7C3AED&center=true&vCenter=true&width=820&lines=Async+crypto+trading+engine;Risk-first+signal+processing;Web+SSE+%2B+Rich+terminal+dashboard)](https://github.com/itanmidnight-ux/PROJECT-5-reco)
+
 ## Identidad pública del repositorio
 
 - **Nombre recomendado:** `reco-trading-bot`
