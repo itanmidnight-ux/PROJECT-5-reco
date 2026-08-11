@@ -44,6 +44,7 @@ MANIFEST
 .env.*.local
 .env.backup*
 *.env.backup*
+config/*.env
 *~
 *.pem
 *.key
@@ -109,9 +110,12 @@ coverage.xml
 # User Data (keep structure but ignore contents)
 # ==============================
 user_data/config.json
+user_data/
 user_data/*.json
 user_data/strategies/*.py
 !user_data/strategies/__init__.py
+* (copy 1)*
+*.backup
 
 # ==============================
 # Model Files (large binaries)
